@@ -1,0 +1,13 @@
+{
+  "name": "reon-glass-controller",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "start": "node server.js"
+  },
+  "devDependencies": {
+    "happy-dom": "*"
+  },
+  "packageManager": "bun@1.4.2"
+}

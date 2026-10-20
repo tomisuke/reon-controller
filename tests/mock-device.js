@@ -1,0 +1,9 @@
+import {CHARACTERISTIC,DEVICE_INFO,SERVICE,manualFrame,THERMO} from '../dist/protocol.js';
+export function mockDevice(window,{failConnect=false,failWrite=false,features=216,levels=20}={}){
+ let busy=false;const writes=[];const callbacks=new Map();
+ async function op(fn){if(busy)throw Error('Concurrent GATT operation');busy=true;try{await Promise.resolve();return fn()}finally{busy=false}}
+ const values={mode:manualFrame(THERMO.cool,3),capability:Uint8Array.of(features,0,levels,0,2),battery:Uint8Array.of(82,1,0,0,90),temperature:Uint8Array.of(1,9,196,9,196,9,196,0,0,0,0,0,0,0,0),autoStart:Uint8Array.of(0),quickLaunch:Uint8Array.of(0)};
+ const chars={};for(const [name,id]of Object.entries(CHARACTERISTIC)){chars[id]={properties:{notify:true},addEventListener(type,cb){callbacks.set(name,cb)},async readValue(){return op(()=>new DataView((values[name]??Uint8Array.of(0)).buffer))},async writeValueWithResponse(frame){return op(()=>{if(failWrite&&name==='mode')throw Error('rejected');writes.push({name,frame:[...frame]});values[name]=new Uint8Array(frame)})},async startNotifications(){return op(()=>{})}}}
+ const device=new window.EventTarget();device.name='RNP-P1';device.gatt={connected:false,async connect(){if(failConnect)throw Error('connect failed');this.connected=true;return this},disconnect(){if(this.connected){this.connected=false;device.dispatchEvent(new window.Event('gattserverdisconnected'))}},async getPrimaryService(id){return op(()=>id===SERVICE.deviceInfo?{async getCharacteristic(id){return op(()=>({async readValue(){return op(()=>new DataView(new TextEncoder().encode(id===DEVICE_INFO.model?'RNP-P1':'2.2.1').buffer))}}))}}:{async getCharacteristic(id){return op(()=>chars[id])}})}};
+ return {device,writes,values,notify(name,value){values[name]=value;callbacks.get(name)?.({target:{value:new DataView(value.buffer)}})}};
+}
