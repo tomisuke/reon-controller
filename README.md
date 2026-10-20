@@ -39,7 +39,7 @@ APIの例:
 
 ## 検証
 
-Bun 1.4.2で `bun install --frozen-lockfile`、`bun test`。テストは83件です。
+Bun 1.4.2で `bun install --frozen-lockfile`、`bun test`。テストは84件です。
 
 - 元リポジトリのプロトコルのバイト列テストを継承。デバイス選択の無応答・キャンセル・時間切れ・遅延応答・権限拒否を含む回帰テスト。
 - センサー境界値、交互入力、機種上限、入力検証、タイムスタンプ。
@@ -60,4 +60,5 @@ Chrome / Edgeのデスクトップ、Android ChromeなどWeb Bluetooth対応環�
 ## 出典とライセンス
 
 [obviyus/rpp-web](https://github.com/obviyus/rpp-web) の `protocol.js` と `reon-client.js` を基にしています。通信の初期化を直列化し、所有者キーの検証と切断時の保留コマンド破棄を追加しました。プロトコルテストは元実装から継承しています。MIT License、Copyright (c) 2026 Ayaan。配布物に `dist/LICENSE` を同梱しています。Sony非公式です。
+
 

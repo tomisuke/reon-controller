@@ -6,3 +6,4 @@ test('permissions policy denial is detected before device selection',()=>expect(
 test('allowed Bluetooth environment passes',()=>expect(bluetoothProblem({navigator:{bluetooth:{requestDevice(){}}},document:{permissionsPolicy:{allowsFeature:()=>true}}})).toBeNull());
 test('selection cancellation is distinct from GATT failure',()=>{expect(connectionError({name:'NotFoundError'})).toContain('選択されませんでした');expect(connectionError({name:'NetworkError'})).toContain('接続に失敗')});
 test('manual cancellation produces no failure',()=>expect(connectionError({name:'AbortError'})).toBeNull());
+test('missing GATT service is not reported as chooser cancellation',()=>expect(connectionError({name:'NotFoundError'},'reading')).toContain('互換性'));

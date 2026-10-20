@@ -6,9 +6,9 @@ export function bluetoothProblem(scope=globalThis) {
   return null;
 }
 
-export function connectionError(error,stage) {
+export function connectionError(error,stage='selecting') {
   if(error.name==='AbortError')return null;
-  if(error.name==='NotFoundError')return 'デバイスが選択されませんでした。本体ボタンを約2秒押して青いランプを点滅させ、もう一度選択してください。';
+  if(error.name==='NotFoundError')return stage==='selecting'?'デバイスが選択されませんでした。本体ボタンを約2秒押して青いランプを点滅させ、もう一度選択してください。':'本体に必要なBluetoothサービスまたは項目が見つかりません。モデルとファームウェアの互換性を確認してください。';
   if(error.name==='SecurityError'||error.name==='NotAllowedError')return 'Bluetoothの利用が許可されていません。URLをChrome / Edgeで直接開き、ブラウザとOSのBluetooth権限を確認してください。';
   if(error.name==='TimeoutError')return stage==='selecting'?'デバイス選択の応答がありません。選択画面が開かない場合はURLをコピーし、Chrome / Edgeで直接開いてください。':'本体との接続が時間切れになりました。本体を近くに置き、再接続してください。';
   if(error.name==='NotSupportedError')return 'このブラウザまたはデバイスでは接続処理を利用できません。対応ブラウザで開いてください。';
