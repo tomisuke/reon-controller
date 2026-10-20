@@ -1,6 +1,7 @@
 import {ReonClient} from './reon-client.js';
 import {THERMO,manualFrame,stopFrame,smartFrame,smartStopFrame,automationFrame,parseMode} from './protocol.js';
 import {DEFAULT_RULES,evaluateRules,validateRules,parseReading} from './sensor.js';
+import {bluetoothProblem} from './bluetooth-environment.js';
 const $=id=>document.getElementById(id);
 const client=new ReonClient();
 const storage={get(key,fallback){try{return JSON.parse(localStorage.getItem(key))??fallback}catch{return fallback}},set(key,value){try{localStorage.setItem(key,JSON.stringify(value))}catch{}}};
@@ -26,8 +27,14 @@ function animateNumber(){const n=$('level-number');n.classList.remove('bump');vo
 function render(){
   const connected=ready(),c=caps(),m=demo?null:state.mode;
   document.body.classList.toggle('warm',kind==='warm');
-  $('connect-label').textContent=demo?'実機を接続':state.connecting?'接続中…':state.connected?'接続を解除':'デバイスを接続';
-  $('connect').disabled=state.connecting;
+  $('connect-label').textContent=state.connecting?'キャンセル':demo?'実機を接続':state.connected?'接続を解除':'デバイスを接続';
+  $('connect').disabled=false;
+  $('demo').disabled=state.connecting;
+  document.querySelectorAll('[data-preset]').forEach(b=>b.disabled=state.connecting);
+  $('connection-feedback').hidden=demo||(!state.connecting&&!state.error);
+  $('connection-spinner').hidden=!state.connecting;
+  $('connection-feedback').classList.toggle('connection-failed',!!state.error);
+  $('connection-message').textContent=state.connecting?({selecting:'ブラウザのデバイス選択待ち',connecting:'本体に接続中…',authenticating:'本体の認証中…',reading:'本体の情報を読み取り中…'}[state.connectionStage]??'接続中…'):state.error??'';
   $('connection-state').textContent=demo?'デモモード':state.connecting?'接続中':state.connected?'接続済み':'未接続';
   $('connection-dot').className='dot'+(connected?' connected':state.connecting?' pending':'');
   $('device-model').textContent=demo?'シミュレーション':state.device&&state.connected?`${state.device.model} · FW ${state.device.firmware}`:'Bluetooth';
@@ -41,8 +48,8 @@ function render(){
   $('dial-dots').innerHTML=Array.from({length:maxLevel()},(_,i)=>`<i class="${i<level?'on':''}"></i>`).join('');
   $('level-buttons').innerHTML=Array.from({length:maxLevel()},(_,i)=>`<button data-level="${i+1}" class="${i+1===level?'selected':''}" aria-label="レベル${i+1}" aria-pressed="${i+1===level}">${i+1}</button>`).join('');
   $('decrease').disabled=level<=1;$('increase').disabled=level>=maxLevel();
-  $('power').classList.toggle('running',running&&connected);$('power').disabled=pending;
-  $('power-label').textContent=pending?'送信中…':running&&connected?'運転を停止':connected?'運転を開始':'接続して運転';
+  $('power').classList.toggle('running',running&&connected);$('power').disabled=pending||state.connecting;
+  $('power-label').textContent=state.connecting?'接続待ち…':pending?'送信中…':running&&connected?'運転を停止':connected?'運転を開始':'接続して運転';
   $('battery').textContent=demo?'82%':state.battery&&state.connected?`${state.battery.level}%`: '—';
   $('surface').textContent=demo?`${(running?24.3:28.1).toFixed(1)} °C`:state.temperature&&state.connected?`${state.temperature.surface.toFixed(1)} °C`:'— °C';
   $('wave').disabled=!connected||!c?.wave||kind==='smart';
@@ -90,12 +97,14 @@ function currentFrame(){return kind==='smart'?smartFrame(smartKind,level):manual
 async function applyManual(start=false){if(!requireConnection())return false;sensorAuto=false;return write(currentFrame(),`${kind==='smart'?'SMART':kind==='warm'?'温熱':'冷却'} レベル${level}${start?' 開始':''}`)}
 async function stop(reason='運転停止'){sensorAuto=false;timerDeadline=0;$('timer').value='0';updateTimer();if(!ready()){running=false;render();return true;}const mode=demo?(kind==='smart'?{type:'smart',kind:smartKind}:null):state.mode;const ok=await write(mode?.type==='smart'?smartStopFrame(mode):stopFrame((mode?.kind??kind)==='warm'?THERMO.warm:THERMO.cool),reason);return ok;}
 async function connect(start=false){
+  if(state.connecting)return false;
   const requested={kind,level,smartKind,wave:$('wave').checked};
-  if(!navigator.bluetooth){toast('対応するBluetoothブラウザで開いてください');return false;}
   if(demo)endDemo();
-  skeleton(true);try{await client.connect();if(!state.connected)return false;if(start){kind=requested.kind;smartKind=requested.smartKind;if(kind==='smart'&&!caps()?.smart)kind=smartKind;level=Math.min(requested.level,maxLevel());$('wave').checked=requested.wave&&!!caps()?.wave;await applyManual(true);}return true;}finally{skeleton(false)}
+  await client.connect();if(!state.connected)return false;if(start){kind=requested.kind;smartKind=requested.smartKind;if(kind==='smart'&&!caps()?.smart)kind=smartKind;level=Math.min(requested.level,maxLevel());$('wave').checked=requested.wave&&!!caps()?.wave;await applyManual(true);}return true;
 }
-$('connect').onclick=async()=>{if(state.connected){await stop('接続を解除');client.disconnect();}else await connect()};
+$('connect').onclick=async()=>{if(state.connecting){client.cancelConnection();return;}if(state.connected){await stop('接続を解除');client.disconnect();}else await connect()};
+$('app-url').value=window.location.origin+window.location.pathname;
+$('copy-url').onclick=async()=>{try{await navigator.clipboard.writeText($('app-url').value);toast('URLをコピーしました。Chrome / Edgeなどの対応ブラウザで開いてください。')}catch{$('app-url').focus();$('app-url').select();toast('URLを選択しました。コピーして対応ブラウザで開いてください。')}};
 $('power').onclick=async()=>{if(pending)return;if(running&&ready())return stop();if(!ready())return connect(true);pending=true;render();try{await applyManual(true)}finally{pending=false;render()}};
 document.querySelectorAll('[data-kind]').forEach(b=>b.onclick=async()=>{smartKind=kind==='warm'?'warm':'cool';kind=b.dataset.kind;level=Math.min(level,maxLevel());sensorAuto=false;render();animateNumber();if(running&&ready())await applyManual()});
 async function chooseLevel(n){level=Math.max(1,Math.min(maxLevel(),n));sensorAuto=false;render();animateNumber();if(ready())await applyManual(true);else toast('接続後、このレベルで運転します')}
@@ -138,12 +147,13 @@ $('add-rule').onclick=()=>{const rows=$('rule-rows').children;const last=rows.le
 $('rules-form').onsubmit=async e=>{e.preventDefault();const next=[...$('rule-rows').children].map(row=>{const [t,k,l]=row.querySelectorAll('input,select');return{temperature:Number(t.value),kind:k.value,level:k.value==='stop'?0:Number(l.value)}});try{validateRules(next);rules=next;storage.set('reon-glass-rules',rules);closeDialogs();toast('ルールを保存しました');render();if(sensorAuto&&reading)await applySensor(reading)}catch(error){$('rules-error').textContent=error.message}};
 function endDemo(){clearInterval(demoTimer);demoTimer=null;demo=false;sensorAuto=false;running=false;reading=null;samples=[];timerDeadline=0;$('timer').value='0';$('wave').checked=false;render();updateTimer();log('デモ終了')}
 $('demo').onclick=async()=>{if(demo){endDemo();return;}if(state.connected){await stop('デモへ切り替え');client.disconnect();}stopPolling();demo=true;running=false;sensorAuto=false;timerDeadline=0;$('timer').value='0';samples=[];source='tag';await acceptReading({temperature:28.4,humidity:62,time:Date.now()});demoTimer=setInterval(()=>{const temperature=+(28.5+Math.sin(Date.now()/15000)*1.9).toFixed(1);acceptReading({temperature,humidity:62,time:Date.now()})},2000);log('デモ開始');render();toast('デモモード · 実機には送信しません')};
-client.onState(s=>{const wasConnected=state.connected;const previousMode=state.mode;state=s;if(!demo){running=!!s.connected&&!!s.mode?.running;if(s.connected&&s.mode&&(s.mode!==previousMode||!wasConnected)){if(s.mode.kind==='warm'||s.mode.kind==='cool'){smartKind=s.mode.kind;kind=s.mode.type==='smart'?'smart':s.mode.kind;level=s.mode.level??s.mode.preference??level;}else if(s.mode.kind==='auto'){kind='smart';level=s.mode.coolPreference??3;}level=Math.min(level,maxLevel());}if(s.tag&&s.tag!==lastTag&&source==='tag'&&s.connected){lastTag=s.tag;acceptReading({temperature:s.tag.temperature,humidity:s.tag.humidity,time:Date.now()});}if(wasConnected&&!s.connected){sensorAuto=false;running=false;timerDeadline=0;$('timer').value='0';log('Bluetooth接続が切れました');toast('Bluetooth接続が切れました');}if(!wasConnected&&s.connected)log('Bluetooth接続完了');if(s.error&&s.error!==lastError){lastError=s.error;toast(s.error.includes('selected')?'デバイスが選択されませんでした':s.error.includes('rejected')?'本体が変更を受け付けませんでした':'接続できません。本体ボタンを2秒押して再試行してください');}render();}});
+client.onState(s=>{const wasConnected=state.connected;const previousMode=state.mode;state=s;if(!demo){running=!!s.connected&&!!s.mode?.running;if(s.connected&&s.mode&&(s.mode!==previousMode||!wasConnected)){if(s.mode.kind==='warm'||s.mode.kind==='cool'){smartKind=s.mode.kind;kind=s.mode.type==='smart'?'smart':s.mode.kind;level=s.mode.level??s.mode.preference??level;}else if(s.mode.kind==='auto'){kind='smart';level=s.mode.coolPreference??3;}level=Math.min(level,maxLevel());}if(s.tag&&s.tag!==lastTag&&source==='tag'&&s.connected){lastTag=s.tag;acceptReading({temperature:s.tag.temperature,humidity:s.tag.humidity,time:Date.now()});}if(wasConnected&&!s.connected){sensorAuto=false;running=false;timerDeadline=0;$('timer').value='0';log('Bluetooth接続が切れました');toast('Bluetooth接続が切れました');}if(!wasConnected&&s.connected)log('Bluetooth接続完了');if(s.error&&s.error!==lastError){lastError=s.error;toast(s.error.includes('rejected')?'本体が変更を受け付けませんでした':s.error);}render();}});
 setInterval(()=>{updateTimer();if(reading&&Date.now()-reading.time>30000&&sensorAuto){stop('センサー更新が30秒途絶えたため停止');toast('センサー更新が途絶えたため停止しました')}renderSensor()},1000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){updateTimer();if(reading&&Date.now()-reading.time>30000&&sensorAuto)stop('センサー値の期限切れで停止')}});
 window.addEventListener('pagehide',()=>{stopPolling();if(state.connected)client.disconnect()});
-$('browser-notice').hidden=!!navigator.bluetooth;
+const browserProblem=bluetoothProblem();$('browser-notice').hidden=!browserProblem;if(browserProblem)$('browser-notice').textContent=browserProblem;
 for(let i=0;i<41;i++){const angle=(135+i*6.75)*Math.PI/180;const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',170+130*Math.cos(angle));line.setAttribute('y1',170+130*Math.sin(angle));line.setAttribute('x2',170+133*Math.cos(angle));line.setAttribute('y2',170+133*Math.sin(angle));line.setAttribute('stroke','#b7cbe1');line.setAttribute('stroke-width','1');$('dial-ticks').append(line)}
 render();setTimeout(()=>skeleton(false),850);
+
 
 

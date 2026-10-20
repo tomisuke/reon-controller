@@ -13,6 +13,7 @@ import {
   tagUnregistrationFrame,
   toHex,
 } from "./protocol.js";
+import { bluetoothProblem, connectionError } from './bluetooth-environment.js';
 
 const OWNER_KEY_STORAGE = "reon-owner-key";
 const TAG_ADDRESS_STORAGE = "reon-tag-address";
@@ -73,7 +74,11 @@ export class ReonClient {
   #listeners = new Set();
   #writeQueue = Promise.resolve();
   #generation = 0;
-  #onDisconnect = () => {
+  #connectionAttempt = 0;
+  #connectionAbort = null;
+  #onDisconnect = (event) => {
+    if (event?.target && event.target !== this.#device) return;
+    this.#connectionAbort?.abort(new DOMException('Connection lost', 'NetworkError'));
     this.#generation++;
     this.#characteristics = {};
     this.#update({ connected: false, connecting: false, mode: null, tag: null });
@@ -82,6 +87,7 @@ export class ReonClient {
   state = {
     connected: false,
     connecting: false,
+    connectionStage: 'idle',
     device: null,
     capabilities: null,
     mode: null,
@@ -117,24 +123,60 @@ export class ReonClient {
   }
 
   async connect() {
-    this.#update({ connecting: true, error: null });
+    if (this.state.connecting || this.state.connected) return;
+    const problem = bluetoothProblem();
+    if (problem) { this.#update({ error: problem, connecting: false, connectionStage: 'idle' }); return; }
+    const attempt = ++this.#connectionAttempt;
+    const controller = new AbortController();
+    this.#connectionAbort = controller;
+    let selected, stage = this.#device ? 'connecting' : 'selecting';
+    let timeout = setTimeout(() => controller.abort(new DOMException('Device chooser timed out', 'TimeoutError')), 45000);
+    const step = (operation, nextStage = stage, discard) => {
+      stage = nextStage;
+      if (controller.signal.aborted || attempt !== this.#connectionAttempt) return Promise.reject(controller.signal.reason ?? new DOMException('Cancelled', 'AbortError'));
+      this.#update({ connectionStage: stage });
+      return new Promise((resolve, reject) => {
+        const abort = () => reject(controller.signal.reason);
+        controller.signal.addEventListener('abort', abort, { once: true });
+        // Invoke synchronously: requestDevice must keep the click's user activation.
+        try {
+          Promise.resolve(operation()).then(value => {
+            controller.signal.removeEventListener('abort', abort);
+            if (controller.signal.aborted || attempt !== this.#connectionAttempt) { discard?.(value); reject(controller.signal.reason ?? new DOMException('Cancelled', 'AbortError')); }
+            else resolve(value);
+          }, error => { controller.signal.removeEventListener('abort', abort); reject(error); });
+        } catch (error) { controller.signal.removeEventListener('abort', abort); reject(error); }
+      });
+    };
+    this.#update({ connecting: true, connectionStage: stage, error: null });
     try {
-      this.#device ??= await navigator.bluetooth.requestDevice({
+      selected = this.#device ?? await step(() => navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: "RNP-" }],
         optionalServices: [SERVICE.control, SERVICE.deviceInfo],
-      });
+      }), 'selecting');
+      this.#device = selected;
+      clearTimeout(timeout);
+      timeout = setTimeout(() => controller.abort(new DOMException('GATT initialization timed out', 'TimeoutError')), 20000);
       this.#device.removeEventListener("gattserverdisconnected", this.#onDisconnect);
       this.#device.addEventListener("gattserverdisconnected", this.#onDisconnect);
 
-      const server = await this.#device.gatt.connect();
-      const control = await server.getPrimaryService(SERVICE.control);
-      const owner = await control.getCharacteristic(CHARACTERISTIC.owner);
+      const server = await step(() => selected.gatt.connect(), 'connecting', late => { if (attempt === this.#connectionAttempt || this.#device !== selected) late.disconnect(); });
+      const control = await step(() => server.getPrimaryService(SERVICE.control));
+      const owner = await step(() => control.getCharacteristic(CHARACTERISTIC.owner), 'authenticating');
       const ownerFrame = Uint8Array.of(1, ...ownerKey());
       this.#log("write", "owner", ownerFrame);
-      await owner.writeValueWithResponse(ownerFrame);
+      await step(() => owner.writeValueWithResponse(ownerFrame));
 
-      const deviceInfo = await this.#readDeviceInfo(server);
-      const capabilityValue = await this.#readCharacteristic(control, "capability");
+      const infoService = await step(() => server.getPrimaryService(SERVICE.deviceInfo), 'reading');
+      const info = {};
+      for (const name of ['model', 'firmware']) {
+        const characteristic = await step(() => infoService.getCharacteristic(DEVICE_INFO[name]));
+        const value = await step(() => characteristic.readValue());
+        info[name] = new TextDecoder().decode(value).replaceAll('\0', '');
+      }
+      const deviceInfo = { name: selected.name, ...info };
+      const capability = await step(() => control.getCharacteristic(CHARACTERISTIC.capability));
+      const capabilityValue = await step(() => capability.readValue());
       const capabilities = parseCapabilities(capabilityValue);
 
       const characteristicNames = ["mode", "battery", "temperature"];
@@ -146,35 +188,47 @@ export class ReonClient {
         characteristicNames.push("quickLaunch");
       }
       for (const name of characteristicNames) {
-          this.#characteristics[name] = await control.getCharacteristic(
+          this.#characteristics[name] = await step(() => control.getCharacteristic(
             CHARACTERISTIC[name],
-          );
+          ));
       }
 
-      for (const name of ["mode", "battery", "temperature"]) await this.#subscribe(name);
-      await this.refresh();
+      for (const name of ["mode", "battery", "temperature"]) await step(() => this.#subscribe(name));
+      const values = [];
+      for (const name of ['mode', 'battery', 'temperature', 'autoStart', 'quickLaunch'].filter(name => this.#characteristics[name])) values.push([name, await step(() => this.#read(name))]);
+      this.#applyValues(values);
       this.#update({
         connected: true,
         connecting: false,
+        connectionStage: 'idle',
         device: deviceInfo,
         capabilities,
       });
     } catch (error) {
-      this.#device?.gatt?.disconnect();
+      if (attempt !== this.#connectionAttempt) return;
+      selected?.gatt?.disconnect();
+      this.#device = undefined;
       this.#characteristics = {};
       this.#update({
         connected: false,
         connecting: false,
-        error:
-          error.name === "NotFoundError"
-            ? "No device selected."
-            : "Connection failed. Hold the device button for 2 seconds, then try again.",
+        connectionStage: 'idle',
+        error: connectionError(error, stage),
       });
       this.#log("error", error.name, new TextEncoder().encode(error.message));
+    } finally {
+      clearTimeout(timeout);
+      if (attempt === this.#connectionAttempt) this.#connectionAbort = null;
     }
   }
 
+  cancelConnection() {
+    this.#connectionAbort?.abort(new DOMException('Cancelled', 'AbortError'));
+    this.#update({ connecting: false, connectionStage: 'idle', error: null });
+  }
+
   disconnect() {
+    this.cancelConnection();
     this.#generation++;
     this.#device?.gatt?.disconnect();
   }
