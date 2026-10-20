@@ -14,6 +14,7 @@ import {
   toHex,
 } from "./protocol.js";
 import { bluetoothProblem, connectionError } from './bluetooth-environment.js';
+import { readable, writable, optionalUnsupported, characteristicProperties, writeCharacteristic } from './gatt.js';
 
 const OWNER_KEY_STORAGE = "reon-owner-key";
 const TAG_ADDRESS_STORAGE = "reon-tag-address";
@@ -76,8 +77,14 @@ export class ReonClient {
   #generation = 0;
   #connectionAttempt = 0;
   #connectionAbort = null;
+  #pollTimer = null;
+  #refreshing = false;
+  #unreadable = new Set();
+  #canRead(name) { return readable(this.#characteristics[name]) && !this.#unreadable.has(name); }
+  #stopPolling() { if (this.#pollTimer !== null) window.clearInterval(this.#pollTimer); this.#pollTimer = null; }
   #onDisconnect = (event) => {
     if (event?.target && event.target !== this.#device) return;
+    this.#stopPolling();
     this.#connectionAbort?.abort(new DOMException('Connection lost', 'NetworkError'));
     this.#generation++;
     this.#characteristics = {};
@@ -99,6 +106,8 @@ export class ReonClient {
     tagLinked: Boolean(localStorage.getItem(TAG_ADDRESS_STORAGE)),
     pairingTag: false,
     error: null,
+    connectionDetail: null,
+    connectionWarnings: [],
   };
 
   onState(listener) {
@@ -129,10 +138,13 @@ export class ReonClient {
     const attempt = ++this.#connectionAttempt;
     const controller = new AbortController();
     this.#connectionAbort = controller;
-    let selected, stage = this.#device ? 'connecting' : 'selecting';
+    let selected, stage = this.#device ? 'connecting' : 'selecting', operationName = 'requestDevice';
+    const properties = {}, info = {}, warnings = [], polling = new Set(), subscribedNames = new Set();
+    this.#unreadable.clear();
     let timeout = setTimeout(() => controller.abort(new DOMException('Device chooser timed out', 'TimeoutError')), 45000);
-    const step = (operation, nextStage = stage, discard) => {
+    const step = (operation, nextStage = stage, label = nextStage, discard) => {
       stage = nextStage;
+      operationName = label;
       if (controller.signal.aborted || attempt !== this.#connectionAttempt) return Promise.reject(controller.signal.reason ?? new DOMException('Cancelled', 'AbortError'));
       this.#update({ connectionStage: stage });
       return new Promise((resolve, reject) => {
@@ -148,35 +160,42 @@ export class ReonClient {
         } catch (error) { controller.signal.removeEventListener('abort', abort); reject(error); }
       });
     };
-    this.#update({ connecting: true, connectionStage: stage, error: null });
+    this.#update({ connecting: true, connectionStage: stage, error: null, connectionDetail: null, connectionWarnings: [] });
     try {
       selected = this.#device ?? await step(() => navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: "RNP-" }],
         optionalServices: [SERVICE.control, SERVICE.deviceInfo],
-      }), 'selecting');
+      }), 'selecting', 'requestDevice');
       this.#device = selected;
       clearTimeout(timeout);
       timeout = setTimeout(() => controller.abort(new DOMException('GATT initialization timed out', 'TimeoutError')), 20000);
       this.#device.removeEventListener("gattserverdisconnected", this.#onDisconnect);
       this.#device.addEventListener("gattserverdisconnected", this.#onDisconnect);
 
-      const server = await step(() => selected.gatt.connect(), 'connecting', late => { if (attempt === this.#connectionAttempt || this.#device !== selected) late.disconnect(); });
-      const control = await step(() => server.getPrimaryService(SERVICE.control));
-      const owner = await step(() => control.getCharacteristic(CHARACTERISTIC.owner), 'authenticating');
+      const server = await step(() => selected.gatt.connect(), 'connecting', 'GATT.connect', late => { if (attempt === this.#connectionAttempt || this.#device !== selected) late.disconnect(); });
+      const control = await step(() => server.getPrimaryService(SERVICE.control), 'connecting', 'control.getPrimaryService');
+      const owner = await step(() => control.getCharacteristic(CHARACTERISTIC.owner), 'authenticating', 'owner.getCharacteristic');
+      properties.owner = characteristicProperties(owner);
       const ownerFrame = Uint8Array.of(1, ...ownerKey());
       this.#log("write", "owner", ownerFrame);
-      await step(() => owner.writeValueWithResponse(ownerFrame));
+      await step(() => writeCharacteristic(owner, ownerFrame), 'authenticating', 'owner.write');
 
-      const infoService = await step(() => server.getPrimaryService(SERVICE.deviceInfo), 'reading');
-      const info = {};
-      for (const name of ['model', 'firmware']) {
-        const characteristic = await step(() => infoService.getCharacteristic(DEVICE_INFO[name]));
-        const value = await step(() => characteristic.readValue());
-        info[name] = new TextDecoder().decode(value).replaceAll('\0', '');
-      }
-      const deviceInfo = { name: selected.name, ...info };
-      const capability = await step(() => control.getCharacteristic(CHARACTERISTIC.capability));
-      const capabilityValue = await step(() => capability.readValue());
+      try {
+        const infoService = await step(() => server.getPrimaryService(SERVICE.deviceInfo), 'reading', 'deviceInfo.getPrimaryService');
+        for (const name of ['model', 'firmware']) {
+          try {
+            const characteristic = await step(() => infoService.getCharacteristic(DEVICE_INFO[name]), 'reading', `${name}.getCharacteristic`);
+            properties[name] = characteristicProperties(characteristic);
+            if (!readable(characteristic)) throw new DOMException('Characteristic is not readable', 'NotSupportedError');
+            const value = await step(() => characteristic.readValue(), 'reading', `${name}.read`);
+            info[name] = new TextDecoder().decode(value).replaceAll('\0', '');
+          } catch (error) { if (!optionalUnsupported(error)) throw error; warnings.push(`${name}: ${error.name}`); }
+        }
+      } catch (error) { if (!optionalUnsupported(error)) throw error; warnings.push(`deviceInfo: ${error.name}`); }
+      const deviceInfo = { name: selected.name, model: info.model??selected.name, firmware: info.firmware??'—' };
+      const capability = await step(() => control.getCharacteristic(CHARACTERISTIC.capability), 'reading', 'capability.getCharacteristic');
+      properties.capability = characteristicProperties(capability);
+      const capabilityValue = await step(() => capability.readValue(), 'reading', 'capability.read');
       const capabilities = parseCapabilities(capabilityValue);
 
       const characteristicNames = ["mode", "battery", "temperature"];
@@ -188,14 +207,33 @@ export class ReonClient {
         characteristicNames.push("quickLaunch");
       }
       for (const name of characteristicNames) {
-          this.#characteristics[name] = await step(() => control.getCharacteristic(
-            CHARACTERISTIC[name],
-          ));
+        try {
+          const characteristic = await step(() => control.getCharacteristic(CHARACTERISTIC[name]), 'reading', `${name}.getCharacteristic`);
+          properties[name] = characteristicProperties(characteristic);
+          this.#characteristics[name] = characteristic;
+          if (name === 'mode' && !writable(characteristic)) throw new DOMException('Mode characteristic is not writable', 'NotSupportedError');
+        } catch (error) { if (name === 'mode' || !optionalUnsupported(error)) throw error; warnings.push(`${name}: ${error.name}`); }
       }
+      capabilities.autoStart = capabilities.autoStart && writable(this.#characteristics.autoStart);
+      capabilities.quickLaunch = capabilities.quickLaunch && writable(this.#characteristics.quickLaunch);
+      capabilities.tagLink = writable(this.#characteristics.authentication);
 
-      for (const name of ["mode", "battery", "temperature"]) await step(() => this.#subscribe(name));
+      for (const name of ['mode', 'battery', 'temperature'].filter(name=>this.#characteristics[name])) {
+        let subscribed = false;
+        try { subscribed = await step(() => this.#subscribe(name), 'reading', `${name}.startNotifications`); }
+        catch (error) { if (!optionalUnsupported(error)) throw error; warnings.push(`${name}.startNotifications: ${error.name}`); }
+        if (!subscribed && readable(this.#characteristics[name])) polling.add(name);
+        if (subscribed) subscribedNames.add(name);
+        if (name === 'mode' && !subscribed && !readable(this.#characteristics[name])) throw new DOMException('Mode has no supported state read or notification procedure', 'NotSupportedError');
+      }
       const values = [];
-      for (const name of ['mode', 'battery', 'temperature', 'autoStart', 'quickLaunch'].filter(name => this.#characteristics[name])) values.push([name, await step(() => this.#read(name))]);
+      for (const name of ['mode', 'battery', 'temperature', 'autoStart', 'quickLaunch'].filter(name => readable(this.#characteristics[name]))) {
+        try { values.push([name, await step(() => this.#read(name), 'reading', `${name}.read`)]); }
+        catch (error) {
+          if (!optionalUnsupported(error) || (name === 'mode' && !subscribedNames.has(name))) throw error;
+          this.#unreadable.add(name); polling.delete(name); warnings.push(`${name}.read: ${error.name}`);
+        }
+      }
       this.#applyValues(values);
       this.#update({
         connected: true,
@@ -203,7 +241,14 @@ export class ReonClient {
         connectionStage: 'idle',
         device: deviceInfo,
         capabilities,
+        connectionWarnings: warnings,
+        connectionDetail: { device: selected.name, model: info.model??null, firmware: info.firmware??null, properties, polling: [...polling], warnings },
       });
+      this.#stopPolling();
+      if (polling.size) this.#pollTimer = window.setInterval(() => {
+        if (!this.state.connected || this.#refreshing) return;
+        this.refresh([...polling]).catch(error => { this.#log('error', 'poll', new TextEncoder().encode(error.message)); });
+      }, 5000);
     } catch (error) {
       if (attempt !== this.#connectionAttempt) return;
       selected?.gatt?.disconnect();
@@ -213,7 +258,8 @@ export class ReonClient {
         connected: false,
         connecting: false,
         connectionStage: 'idle',
-        error: connectionError(error, stage),
+        error: connectionError(error, stage, operationName),
+        connectionDetail: { stage, operation: operationName, error: error.name, message: error.message, device: selected?.name??null, model: info.model??null, firmware: info.firmware??null, properties, warnings },
       });
       this.#log("error", error.name, new TextEncoder().encode(error.message));
     } finally {
@@ -228,22 +274,33 @@ export class ReonClient {
   }
 
   disconnect() {
+    this.#stopPolling();
     this.cancelConnection();
     this.#generation++;
     this.#device?.gatt?.disconnect();
   }
 
-  async refresh() {
-    const names = [
+  async refresh(requestedNames = [
       "mode",
       "battery",
       "temperature",
       "autoStart",
       "quickLaunch",
-    ].filter((name) => this.#characteristics[name]);
-    const values = [];
-    for (const name of names) values.push([name, await this.#read(name)]);
-    this.#applyValues(values);
+    ]) {
+    if (this.#refreshing) return;
+    this.#refreshing = true;
+    const generation = this.#generation;
+    const run = this.#writeQueue.then(async () => {
+      if (generation !== this.#generation || !this.state.connected) return;
+      const values = [];
+      for (const name of requestedNames.filter(name => this.#canRead(name))) {
+        if (generation !== this.#generation) return;
+        values.push([name, await this.#read(name)]);
+      }
+      if (generation === this.#generation) this.#applyValues(values);
+    });
+    this.#writeQueue = run.catch(()=>{});
+    try { await run; } finally { this.#refreshing = false; }
   }
 
   writeMode(frame) {
@@ -316,14 +373,15 @@ export class ReonClient {
 
   async #subscribe(name) {
     const characteristic = this.#characteristics[name];
-    if (!characteristic.properties.notify) {
-      return;
+    if (!characteristic.properties.notify && !characteristic.properties.indicate) {
+      return false;
     }
     characteristic.addEventListener("characteristicvaluechanged", (event) => {
       this.#log("notify", name, event.target.value);
       this.#applyValues([[name, event.target.value]]);
     });
     await characteristic.startNotifications();
+    return true;
   }
 
   #applyValues(values) {
@@ -352,8 +410,8 @@ export class ReonClient {
       .then(async () => {
         if (generation !== this.#generation || !this.#characteristics[name]) return false;
         this.#log("write", name, frame);
-        await this.#characteristics[name].writeValueWithResponse(frame);
-        if (readBack) {
+        await writeCharacteristic(this.#characteristics[name], frame);
+        if (readBack && this.#canRead(name)) {
           this.#applyValues([[name, await this.#read(name)]]);
         }
         return true;

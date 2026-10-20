@@ -57,9 +57,12 @@ function render(){
   $('auto-start').disabled=!connected||!c?.autoStart;$('quick-launch').disabled=!connected||!c?.quickLaunch;
   if(!demo){$('auto-start').checked=state.autoStart??false;$('quick-launch').checked=state.quickLaunch??false;$('wave').checked=state.mode?.type==='manual'&&!!state.mode.wave;}
   $('sensor-auto').checked=sensorAuto;
-  $('link-tag').disabled=!connected||state.pairingTag;
+  $('link-tag').disabled=!connected||state.pairingTag||c?.tagLink===false;
   $('link-tag').textContent=state.pairingTag?'Tagを検索中…':state.tagLinked&&!demo?'Tagの接続を解除':'Tagを接続';
   $('device-info').textContent=demo?'DEMO · デバイスへの送信は行いません':state.connected?`${state.device?.name??'REON'} · ${state.device?.model??''} · Firmware ${state.device?.firmware??''}`:'デバイス未接続';
+  $('connection-details').hidden=!state.connectionDetail||demo;
+  const diagnostic=state.connectionDetail?JSON.stringify(state.connectionDetail,null,2):'接続履歴はありません';
+  $('connection-diagnostic').textContent=diagnostic;$('settings-connection-diagnostic').textContent=demo?'デモモード':diagnostic;
   $('rule-count').textContent=`${rules.length} ルール`;
   renderSensor();
 }
@@ -104,6 +107,7 @@ async function connect(start=false){
 }
 $('connect').onclick=async()=>{if(state.connecting){client.cancelConnection();return;}if(state.connected){await stop('接続を解除');client.disconnect();}else await connect()};
 $('app-url').value=window.location.origin+window.location.pathname;
+document.querySelectorAll('[data-copy-diagnostics]').forEach(button=>button.onclick=async()=>{if(!state.connectionDetail){toast('接続履歴はありません');return;}try{await navigator.clipboard.writeText(JSON.stringify(state.connectionDetail,null,2));toast('接続の詳細をコピーしました')}catch{toast('接続の詳細を開き、テキストを選択してコピーしてください')}});
 $('copy-url').onclick=async()=>{try{await navigator.clipboard.writeText($('app-url').value);toast('URLをコピーしました。Chrome / Edgeなどの対応ブラウザで開いてください。')}catch{$('app-url').focus();$('app-url').select();toast('URLを選択しました。コピーして対応ブラウザで開いてください。')}};
 $('power').onclick=async()=>{if(pending)return;if(running&&ready())return stop();if(!ready())return connect(true);pending=true;render();try{await applyManual(true)}finally{pending=false;render()}};
 document.querySelectorAll('[data-kind]').forEach(b=>b.onclick=async()=>{smartKind=kind==='warm'?'warm':'cool';kind=b.dataset.kind;level=Math.min(level,maxLevel());sensorAuto=false;render();animateNumber();if(running&&ready())await applyManual()});
@@ -154,6 +158,7 @@ window.addEventListener('pagehide',()=>{stopPolling();if(state.connected)client.
 const browserProblem=bluetoothProblem();$('browser-notice').hidden=!browserProblem;if(browserProblem)$('browser-notice').textContent=browserProblem;
 for(let i=0;i<41;i++){const angle=(135+i*6.75)*Math.PI/180;const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',170+130*Math.cos(angle));line.setAttribute('y1',170+130*Math.sin(angle));line.setAttribute('x2',170+133*Math.cos(angle));line.setAttribute('y2',170+133*Math.sin(angle));line.setAttribute('stroke','#b7cbe1');line.setAttribute('stroke-width','1');$('dial-ticks').append(line)}
 render();setTimeout(()=>skeleton(false),850);
+
 
 
 
