@@ -33,8 +33,14 @@ export async function api(request,env) {
   while(true){const {done,value}=await reader.read();if(done)break;text+=new TextDecoder().decode(value);if(text.length>16000){await reader.cancel();return json({error:'Payload too large'},413);}}
   try { payload=JSON.parse(text); if (typeof payload.active!=='boolean') throw Error('active is required');
     if(payload.active && (!Number.isFinite(payload.score)||payload.score<0||payload.score>100||!Number.isInteger(payload.personCount)||payload.personCount<0||payload.personCount>30||!Number.isFinite(payload.fullScale)||payload.fullScale<.05||payload.fullScale>1))throw Error('Invalid score, personCount, or fullScale');
-    const result=payload.active ? {score:payload.personCount<2?100:Math.round(payload.score*10)/10,personCount:payload.personCount,status:payload.personCount<2?'insufficient_people':'tracking',fullScale:payload.fullScale} : {score:100,personCount:0,status:'stopped',fullScale:1};
-    session.reading={score:result.score,personCount:result.personCount,status:result.status,fullScale:result.fullScale,active:payload.active,receivedAt:Date.now()};
+    if(payload.holding!==undefined&&typeof payload.holding!=='boolean')throw Error('Invalid holding');
+    if(payload.holding&&(!Number.isFinite(payload.holdRemainingMs)||payload.holdRemainingMs<=0||payload.holdRemainingMs>3000||payload.personCount>=2))throw Error('Invalid hold duration');
+    if(payload.holdEpoch!==undefined&&(!Number.isFinite(payload.holdEpoch)||payload.holdEpoch<0))throw Error('Invalid hold epoch');
+    const now=Date.now(),holding=payload.active&&payload.holding===true;
+    const sameHold=session.reading?.status==='holding'&&session.reading.holdEpoch===payload.holdEpoch;
+    const holdUntil=holding?Math.min(now+payload.holdRemainingMs,sameHold?session.reading.holdUntil??now:Infinity):null;
+    const result=payload.active ? {score:payload.personCount<2&&!holding?100:Math.round(payload.score*10)/10,personCount:payload.personCount,status:holding?'holding':payload.personCount<2?'insufficient_people':'tracking',fullScale:payload.fullScale} : {score:100,personCount:0,status:'stopped',fullScale:1};
+    session.reading={...result,holdUntil,holdEpoch:payload.holdEpoch,active:payload.active,receivedAt:now};
   } catch(error) { return json({error:error.message},400); }
   // No frames, positions, or video are persisted; only the latest scalar reading.
   await env.BUCKET.put('distance/'+match[1],JSON.stringify(session),{httpMetadata:{contentType:'application/json'}});
