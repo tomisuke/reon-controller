@@ -1,0 +1,16 @@
+import {test,expect} from 'bun:test';
+import {motionMagnitude,motionOutput,parseMotionPacket,isNewSequence,validateMotionConfig} from '../dist/motion.js';
+import {motionPacket} from './mock-m5.js';
+test.each([[0,0,1],[1,0,0],[0,-1,0],[0,0,-1],[0.6,0.8,0]])('static gravity vector %# produces zero motion',(x,y,z)=>expect(motionMagnitude({x,y,z})).toBeCloseTo(0,8));
+test('larger deviation produces monotonically warmer output',()=>{let previous=-Infinity;for(let i=0;i<=1000;i++){const output=motionOutput(i/1000);const signed=output.kind==='cool'?-output.level:output.kind==='warm'?output.level:0;expect(signed>=previous).toBe(true);previous=signed}});
+test.each([[0,'cool',3],[0.25,'cool',2],[0.5,'stop',0],[0.75,'warm',1],[1,'warm',2],[8,'warm',2]])('motion %s maps to %s %s',(value,kind,level)=>expect(motionOutput(value)).toMatchObject({kind,level}));
+test('no hysteresis across switching point',()=>expect([0.49,0.51,0.49,0.51].map(value=>motionOutput(value).kind)).toEqual(['cool','warm','cool','warm']));
+test('output respects both hardware maxima',()=>{expect(motionOutput(0,{fullScale:1,coolMax:5,warmMax:5},{coolLevels:3,warmLevels:2}).level).toBe(3);expect(motionOutput(1,{fullScale:1,coolMax:5,warmMax:5},{coolLevels:3,warmLevels:2}).level).toBe(2)});
+test('sensitivity rescales the full range',()=>expect(motionOutput(1,{fullScale:2,coolMax:3,warmMax:2}).kind).toBe('stop'));
+test.each([null,{fullScale:0,coolMax:3,warmMax:2},{fullScale:NaN,coolMax:3,warmMax:2},{fullScale:1,coolMax:0,warmMax:2},{fullScale:1,coolMax:3,warmMax:6}])('invalid configuration %# is rejected',config=>expect(()=>validateMotionConfig(config)).toThrow());
+test.each([NaN,Infinity,-0.1])('invalid motion %s is rejected',value=>expect(()=>motionOutput(value)).toThrow());
+test('packet parses float32 axes, sequence and uptime without wall clock assumptions',()=>expect(parseMotionPacket(motionPacket({x:0,y:0,z:2,sequence:65535,uptime:4294967295}),2000)).toEqual({x:0,y:0,z:2,motion:1,sequence:65535,uptime:4294967295,time:2000}));
+test('typed array offsets are respected',()=>{const bytes=new Uint8Array(30);bytes.set(new Uint8Array(motionPacket({z:2}).buffer),5);expect(parseMotionPacket(bytes.subarray(5,25)).motion).toBe(1)});
+test.each([{version:2},{flags:0},{x:NaN},{z:Infinity},{y:33}])('invalid packet %# is rejected',sample=>expect(()=>parseMotionPacket(motionPacket(sample))).toThrow());
+test('wrong packet length is rejected',()=>expect(()=>parseMotionPacket(new DataView(new ArrayBuffer(19)))).toThrow());
+test('sequence handles wrap and refuses repeats or old data',()=>{expect(isNewSequence(0,65535)).toBe(true);expect(isNewSequence(0,0)).toBe(false);expect(isNewSequence(65535,0)).toBe(false);expect(isNewSequence(500,null)).toBe(true)});

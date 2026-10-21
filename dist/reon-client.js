@@ -303,8 +303,8 @@ export class ReonClient {
     try { await run; } finally { this.#refreshing = false; }
   }
 
-  writeMode(frame) {
-    return this.#write("mode", frame);
+  writeMode(frame, guard) {
+    return this.#write("mode", frame, true, guard);
   }
 
   writeAutomation(name, frame) {
@@ -404,10 +404,11 @@ export class ReonClient {
     this.#update(patch);
   }
 
-  #write(name, frame, readBack = true) {
+  #write(name, frame, readBack = true, guard) {
     const generation = this.#generation;
     this.#writeQueue = this.#writeQueue
       .then(async () => {
+        if (guard && !guard()) return null;
         if (generation !== this.#generation || !this.#characteristics[name]) return false;
         this.#log("write", name, frame);
         await writeCharacteristic(this.#characteristics[name], frame);

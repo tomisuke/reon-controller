@@ -3,3 +3,5 @@ node_modules/
 .sites-checkout/
 *.tar.gz
 *.zip
+.pio/
+!dist/firmware/M5StickS3-Motion.zip
