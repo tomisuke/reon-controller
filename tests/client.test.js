@@ -2,11 +2,42 @@ import {describe,test,expect,beforeEach,afterEach} from 'bun:test';
 import {Window} from 'happy-dom';
 import {ReonClient} from '../dist/reon-client.js';
 import {mockDevice} from './mock-device.js';
-import {manualFrame,THERMO} from '../dist/protocol.js';
+import {manualFrame,THERMO,stopFrame,CHARACTERISTIC,SERVICE} from '../dist/protocol.js';
 let w,hardware;
 beforeEach(()=>{w=new Window({url:'http://localhost'});globalThis.window=w;globalThis.document=w.document;globalThis.localStorage=w.localStorage;globalThis.CustomEvent=w.CustomEvent;hardware=mockDevice(w);Object.defineProperty(globalThis,'navigator',{configurable:true,value:{bluetooth:{requestDevice:async()=>hardware.device}}})});
 afterEach(()=>w.happyDOM.abort());
 describe('Bluetooth client with strict serial mock GATT',()=>{
+ for(const delay of [3000,10000,20000])test('manual control disables saved wear auto-stop before run at '+delay+'ms',async()=>{
+  hardware=mockDevice(w,{autoStart:true,autoStopAfterMs:delay});const c=new ReonClient();await c.connect();expect(c.state.autoStart).toBe(true);
+  expect(await c.writeMode(manualFrame(THERMO.cool,4))).toBe(true);
+  const writes=hardware.writes.filter(x=>['autoStart','mode'].includes(x.name));expect(writes.map(x=>x.name)).toEqual(['autoStart','mode']);expect(writes[0].frame).toEqual([0]);
+  hardware.advanceTime(30000);expect(c.state.connected).toBe(true);expect(c.state.mode.running).toBe(true);expect(c.state.manualControl.readBackVerified).toBe(true);
+  await c.writeMode(manualFrame(THERMO.warm,2));expect(hardware.writes.filter(x=>x.name==='autoStart')).toHaveLength(1);hardware.advanceTime(30000);expect(c.state.mode.running).toBe(true);
+ });
+ test('legacy run without clearing device auto-start reproduces connected stop',async()=>{
+  hardware=mockDevice(w,{autoStart:true,autoStopAfterMs:3000});const c=new ReonClient();await c.connect();
+  const service=await hardware.device.gatt.getPrimaryService(SERVICE.control),mode=await service.getCharacteristic(CHARACTERISTIC.mode);await mode.writeValueWithResponse(manualFrame(THERMO.cool,3));
+  hardware.advanceTime(3001);expect(c.state.connected).toBe(true);expect(c.state.mode.running).toBe(false);expect(c.state.lastStop.source).toBe('device_report');
+ });
+ test('refused auto-stop disable prevents running and gives a specific error',async()=>{
+  hardware=mockDevice(w,{autoStart:true,ignoreAutoStartWrite:true});const c=new ReonClient();await c.connect();
+  expect(await c.writeMode(manualFrame(THERMO.cool,3))).toBe(false);expect(hardware.writes.filter(x=>x.name==='mode')).toHaveLength(0);expect(c.state.error).toContain('AUTO START/STOP');
+ });
+ test('auto-stop write failure does not fall through to run',async()=>{
+  hardware=mockDevice(w,{autoStart:true,errors:{'autoStart.writeValueWithResponse':{name:'NetworkError',message:'failed'}}});const c=new ReonClient();await c.connect();
+  expect(await c.writeMode(manualFrame(THERMO.warm,2))).toBe(false);expect(hardware.writes.filter(x=>x.name==='mode')).toHaveLength(0);expect(c.state.error).toContain('AUTO START/STOP');
+ });
+ test('write-only auto-stop is sent once and readback is marked unverified',async()=>{
+  hardware=mockDevice(w,{autoStart:true,propertyOverrides:{autoStart:{read:false}}});const c=new ReonClient();await c.connect();
+  expect(await c.writeMode(manualFrame(THERMO.cool,3))).toBe(true);expect(c.state.manualControl.readBackVerified).toBe(false);expect(c.state.autoStart).toBeNull();await c.writeMode(manualFrame(THERMO.warm,2));expect(hardware.writes.filter(x=>x.name==='autoStart')).toHaveLength(1);
+ });
+ test('manual stop is distinguished and device stop is never automatically restarted',async()=>{
+  const c=new ReonClient();await c.connect();await c.writeMode(manualFrame(THERMO.cool,3));await c.writeMode(stopFrame(THERMO.cool));expect(c.state.lastStop.source).toBe('app_command');
+  await c.writeMode(manualFrame(THERMO.cool,3));const count=hardware.writes.length;hardware.notify('mode',stopFrame(THERMO.cool));await Promise.resolve();expect(c.state.lastStop.source).toBe('device_report');expect(hardware.writes.length).toBe(count);expect(c.state.mode.running).toBe(false);
+ });
+ test('expired run guard during auto-stop preparation cancels the queued run',async()=>{
+  const c=new ReonClient();await c.connect();let active=true;const off=c.onState(s=>{if(s.manualControl)active=false;});expect(await c.writeMode(manualFrame(THERMO.cool,3),()=>active)).toBeNull();expect(hardware.writes.filter(x=>x.name==='mode')).toHaveLength(0);off();
+ });
  test('connects without concurrent GATT operations, authenticates and reads capabilities',async()=>{const c=new ReonClient();await c.connect();expect(c.state.connected).toBe(true);expect(c.state.device.model).toBe('RNP-P1');expect(c.state.capabilities.coolLevels).toBe(5);expect(c.state.battery.level).toBe(82);expect(hardware.writes[0].name).toBe('owner');expect(hardware.writes[0].frame.length).toBe(17)});
  test('roundtrips commands and writes every alternating sample in order',async()=>{const c=new ReonClient();await c.connect();expect(await Promise.all([5,3,5,3].map(n=>c.writeMode(manualFrame(THERMO.cool,n))))).toEqual([true,true,true,true]);expect(hardware.writes.filter(w=>w.name==='mode').map(w=>w.frame[4]+1)).toEqual([5,3,5,3]);expect(c.state.mode.level).toBe(3)});
  test('disconnect prevents queued commands from being sent',async()=>{const c=new ReonClient();await c.connect();const pending=c.writeMode(manualFrame(THERMO.cool,5));c.disconnect();expect(await pending).toBe(false);expect(c.state.connected).toBe(false);expect(hardware.writes.filter(w=>w.name==='mode')).toHaveLength(0)});
