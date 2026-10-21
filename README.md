@@ -6,7 +6,7 @@ REON Pocket Pro Plus向けのWeb Bluetoothコントローラ。白基調のLiqui
 
 Node.js 24以降で `node server.js` を実行し、http://localhost:4173 を開きます。本体のSMARTボタンを約2秒押し、デバイスを接続します。本体を選ぶ操作はブラウザの要件です。「接続して運転」またはプリセットから接続と開始をまとめて行えます。
 
-デプロイする場合は `dist/` をHTTPSの静的ホスティングへ配置します。SitesのIDは `.openai/hosting.json` に保存しています。
+配信はWorker ESMとR2です。`node scripts/build.mjs` でビルドし、Sitesのソース同期・パッケージ・配信ワークフローで公開します。SitesのIDは `.openai/hosting.json` に保存しています。
 
 ## 操作
 
@@ -79,4 +79,11 @@ Chrome / Edgeのデスクトップ、Android ChromeなどWeb Bluetooth対応環�
 
 [obviyus/rpp-web](https://github.com/obviyus/rpp-web) の `protocol.js` と `reon-client.js` を基にしています。通信の初期化を直列化し、所有者キーの検証と切断時の保留コマンド破棄を追加しました。プロトコルテストは元実装から継承しています。MIT License、Copyright (c) 2026 Ayaan。配布物に `dist/LICENSE` を同梱しています。Sony非公式です。
 
+
+
+## 人物間の距離
+
+映像から0〜100の距離スコアを算出するサービスを追加。入口は /distance。REON画面の「人物間の距離」カードで参照・画面内解析、別端末では共有JSON APIを利用できます。技術選定の全理由、距離の定義、API契約、利用条件は DISTANCE.md に記載しています。
+
+配信は静的ホスティングからWorker ESMとR2へ移行しました。ローカル起動前に node scripts/build.mjs を実行してください。既存のBluetoothモジュールは維持しています。
 

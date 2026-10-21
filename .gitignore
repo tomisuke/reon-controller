@@ -5,3 +5,5 @@ node_modules/
 *.zip
 .pio/
 !dist/firmware/M5StickS3-Motion.zip
+dist/server/
+dist/.openai/
