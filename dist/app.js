@@ -4,17 +4,19 @@ import {DEFAULT_RULES,evaluateRules,validateRules,parseReading} from './sensor.j
 import {bluetoothProblem} from './bluetooth-environment.js';
 import {M5Client} from './m5-client.js';
 import {DEFAULT_MOTION_CONFIG,MOTION_STALE_MS,validateMotionConfig,motionOutput} from './motion.js';
+import {distanceOutput,distanceSample} from './distance-output.js';
 const $=id=>document.getElementById(id);
 const client=new ReonClient();
 const m5=new M5Client();
 const storage={get(key,fallback){try{return JSON.parse(localStorage.getItem(key))??fallback}catch{return fallback}},set(key,value){try{localStorage.setItem(key,JSON.stringify(value))}catch{}}};
 let motionConfig=storage.get('reon-motion-config',DEFAULT_MOTION_CONFIG);try{validateMotionConfig(motionConfig)}catch{motionConfig={...DEFAULT_MOTION_CONFIG}}
 let motionAuto=false,motionEpoch=0,motionReading=null,m5State=m5.state,motionDemoTimer=null;
+let distanceAuto=false,distanceEpoch=0,distanceReading=null,distanceReceivedAt=0,distanceJob=null,distanceSending=false,distanceApplied=null;
 let rules=storage.get('reon-glass-rules',DEFAULT_RULES);try{validateRules(rules)}catch{rules=structuredClone(DEFAULT_RULES)}
 let demo=false,kind='cool',level=3,running=false,sensorAuto=false,source='tag',reading=null,pending=false;
 let pollController=null,pollTimer=null,pollGeneration=0,demoTimer=null,lastTag=null,toastTimer,lastError=null;
 let state=client.state;
-const demoCaps={coolLevels:5,warmLevels:3,environmentalSensor:true};
+const demoCaps={coolLevels:5,warmLevels:4,environmentalSensor:true};
 const caps=()=>demo?demoCaps:state.capabilities;
 const ready=()=>demo||state.connected;
 const maxLevel=()=>kind==='warm'?(caps()?.warmLevels??3):(caps()?.coolLevels??5);
@@ -64,6 +66,7 @@ function render(){
   $('rule-count').textContent=`${rules.length} ルール`;
   renderSensor();
   renderMotion();
+  renderDistanceLink();
 }
 function renderSensor(){
   const valid=reading&&Date.now()-reading.time<=30000;
@@ -83,12 +86,12 @@ async function write(frame,message,guard){
   const success=demo?true:await client.writeMode(frame,guard);
   if(success===null)return null;
   if(demo){const m=parseMode(frame);running=m.running;}
-  if(success){if(message)log(message);}else{toast('本体に反映できませんでした。再接続してください');sensorAuto=false;disableMotion();}
+  if(success){if(message)log(message);}else{toast('本体に反映できませんでした。再接続してください');sensorAuto=false;disableMotion();disableDistance();}
   render();return success;
 }
 function currentFrame(){return manualFrame(kind==='warm'?THERMO.warm:THERMO.cool,level,false)}
-async function applyManual(start=false){if(!requireConnection())return false;sensorAuto=false;disableMotion();return write(currentFrame(),`${kind==='warm'?'温熱':'冷却'} レベル${level}${start?' 開始':''}`)}
-async function stop(reason='運転停止'){sensorAuto=false;disableMotion();if(!ready()){running=false;render();return true;}const mode=demo?null:state.mode;const ok=await write(mode?.type==='smart'?smartStopFrame(mode):stopFrame((mode?.kind??kind)==='warm'?THERMO.warm:THERMO.cool),reason);return ok;}
+async function applyManual(start=false){if(!requireConnection())return false;sensorAuto=false;disableMotion();disableDistance();return write(currentFrame(),`${kind==='warm'?'温熱':'冷却'} レベル${level}${start?' 開始':''}`)}
+async function stop(reason='運転停止'){sensorAuto=false;disableMotion();disableDistance();if(!ready()){running=false;render();return true;}const mode=demo?null:state.mode;const ok=await write(mode?.type==='smart'?smartStopFrame(mode):stopFrame((mode?.kind??kind)==='warm'?THERMO.warm:THERMO.cool),reason);return ok;}
 async function connect(start=false){
   if(state.connecting)return false;
   const requested={kind,level};
@@ -102,7 +105,7 @@ $('copy-url').onclick=async()=>{try{await navigator.clipboard.writeText($('app-u
 $('power').onclick=async()=>{if(pending)return;if(running&&ready())return stop();if(!ready())return connect(true);pending=true;render();try{await applyManual(true)}finally{pending=false;render()}};
 async function chooseOutput(outputKind,outputLevel){
   if(state.connecting||pending)return;
-  disableMotion();sensorAuto=false;kind=outputKind;level=Math.max(1,Math.min(maxLevel(),outputLevel));render();
+  disableMotion();disableDistance();sensorAuto=false;kind=outputKind;level=Math.max(1,Math.min(maxLevel(),outputLevel));render();
   if(ready())await applyManual(true);else await connect(true);
 }
 for(const id of ['cool-levels','warm-levels'])$(id).onclick=e=>{const b=e.target.closest('[data-output]');if(b)chooseOutput(b.dataset.output,Number(b.dataset.level));};
@@ -122,7 +125,7 @@ async function applySensor(value){
   }else{kind=action.kind;level=action.level;await write(manualFrame(kind==='warm'?THERMO.warm:THERMO.cool,level,false),`センサー ${value.temperature.toFixed(1)}°C → ${kind==='warm'?'温熱':'冷却'} ${level}`);}
   render();
 }
-$('sensor-auto').onchange=async()=>{if(!$('sensor-auto').checked){sensorAuto=false;render();log('センサー連動オフ');return;}if(!requireConnection()){$('sensor-auto').checked=false;return;}if(!reading||Date.now()-reading.time>30000){$('sensor-auto').checked=false;toast('有効なセンサー値が必要です');openDialog('sensor-dialog');return;}disableMotion();sensorAuto=true;await applySensor(reading);render()};
+$('sensor-auto').onchange=async()=>{if(!$('sensor-auto').checked){sensorAuto=false;render();log('センサー連動オフ');return;}if(!requireConnection()){$('sensor-auto').checked=false;return;}if(!reading||Date.now()-reading.time>30000){$('sensor-auto').checked=false;toast('有効なセンサー値が必要です');openDialog('sensor-dialog');return;}disableMotion();disableDistance();sensorAuto=true;await applySensor(reading);render()};
 $('sensor-url').value=storage.get('reon-glass-sensor-url','');$('poll-interval').value=storage.get('reon-glass-poll-interval','1000');
 $('api-panel').onsubmit=async e=>{e.preventDefault();let url;try{url=new URL($('sensor-url').value);if(url.protocol!=='https:'&&!(url.protocol==='http:'&&['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw Error();if(url.username||url.password)throw Error();}catch{$('sensor-message').textContent='認証情報を含まないHTTPS URLを入力してください';return;}
   if(demo)endDemo();stopPolling();source='api';reading=null;sensorAuto=false;const generation=pollGeneration;const interval=Number($('poll-interval').value);storage.set('reon-glass-sensor-url',url.href);storage.set('reon-glass-poll-interval',String(interval));
@@ -135,6 +138,41 @@ function addRuleRow(r={temperature:35,kind:'cool',level:5}){const row=document.c
 $('add-rule').onclick=()=>{const rows=$('rule-rows').children;const last=rows.length?Number(rows[rows.length-1].querySelector('input').value):30;addRuleRow({temperature:Math.min(80,last+3),kind:'cool',level:5})};
 $('rules-form').onsubmit=async e=>{e.preventDefault();const next=[...$('rule-rows').children].map(row=>{const [t,k,l]=row.querySelectorAll('input,select');return{temperature:Number(t.value),kind:k.value,level:k.value==='stop'?0:Number(l.value)}});try{validateRules(next);rules=next;storage.set('reon-glass-rules',rules);closeDialogs();toast('ルールを保存しました');render();if(sensorAuto&&reading)await applySensor(reading)}catch(error){$('rules-error').textContent=error.message}};
 function motionFresh(sample=motionReading){return !!sample&&Date.now()-sample.time>=0&&Date.now()-sample.time<=MOTION_STALE_MS}
+function distanceAction(){const score=distanceSample(distanceReading,distanceReceivedAt);return score===null?null:distanceOutput(score,caps()??demoCaps)}
+const outputKey=action=>action?`${action.kind}:${action.level}`:null;
+const outputLabel=action=>!action?'—':action.kind==='stop'?'停止':`${action.kind==='warm'?'温熱':'冷却'} ${action.level}`;
+function disableDistance(){distanceAuto=false;distanceEpoch++;distanceJob=null;distanceApplied=null;$('distance-auto').checked=false;}
+function renderDistanceLink(){
+  $('distance-auto').checked=distanceAuto;
+  $('distance-output').textContent=outputLabel(distanceAction());
+  $('distance-link-status').textContent=distanceAuto?'距離に連動中':'連動OFF';
+  const c=caps();$('distance-link-note').textContent=c&&(c.coolLevels<5||c.warmLevels<4)?`本体の上限に調整：冷却${Math.min(5,c.coolLevels)} / 温熱${Math.min(4,c.warmLevels)}`:'';
+}
+async function pumpDistance(){
+  if(distanceSending)return;distanceSending=true;
+  try{while(distanceJob){
+    const job=distanceJob;distanceJob=null;
+    const guard=()=>distanceAuto&&distanceEpoch===job.epoch&&ready()&&outputKey(distanceAction())===job.key;
+    if(!guard()||distanceApplied===job.key)continue;
+    const action=job.action,mode=demo?null:state.mode;
+    const frame=action.kind==='stop'?(mode?.type==='smart'?smartStopFrame(mode):stopFrame((mode?.kind??kind)==='warm'?THERMO.warm:THERMO.cool)):manualFrame(action.kind==='warm'?THERMO.warm:THERMO.cool,action.level,false);
+    distanceApplied=null;
+    const success=await write(frame,`距離連動 → ${outputLabel(action)}`,guard);
+    if(success&&guard()){distanceApplied=job.key;if(action.kind!=='stop'){kind=action.kind;level=action.level;}render();}
+  }}finally{distanceSending=false;}
+}
+function updateDistanceOutput(){
+  const action=distanceAction();renderDistanceLink();if(!distanceAuto)return;
+  if(!action){stop('距離計測の停止・更新切れで停止');return;}
+  distanceJob={action,key:outputKey(action),epoch:distanceEpoch};void pumpDistance();
+}
+window.addEventListener('reon-distance',({detail})=>{distanceReading=detail;distanceReceivedAt=Date.now();updateDistanceOutput()});
+$('distance-auto').onchange=()=>{
+  if(!$('distance-auto').checked){if(distanceAuto)void stop('距離連動OFFで停止');return;}
+  if(!requireConnection()||!distanceAction()){disableDistance();renderDistanceLink();if(ready())toast('距離計測をONにし、有効な値を受信してください');return;}
+  sensorAuto=false;disableMotion();distanceEpoch++;distanceAuto=true;distanceApplied=null;render();updateDistanceOutput();
+};
+setInterval(updateDistanceOutput,250);
 function disableMotion(){motionAuto=false;motionEpoch++;if($('motion-auto'))$('motion-auto').checked=false;}
 function renderMotion(){
   const fresh=motionFresh(),sample=fresh?motionReading:null;
@@ -166,7 +204,7 @@ async function applyMotion(sample){
 }
 async function receiveMotion(sample){motionReading=sample;renderMotion();if(motionAuto)await applyMotion(sample)}
 $('m5-connect').onclick=async()=>{if(m5State.connecting){m5.cancel();return;}if(m5State.connected){if(motionAuto)await stop('M5StickS3の接続解除で停止');m5.disconnect();return;}if(demo)endDemo();$('motion-error').textContent='';await m5.connect()};
-$('motion-auto').onchange=async()=>{if(!$('motion-auto').checked){disableMotion();renderMotion();return;}if(!requireConnection()){disableMotion();return;}if(!motionFresh()||(!demo&&!m5State.connected)){disableMotion();toast('M5StickS3を接続し、加速度を受信してください');return;}sensorAuto=false;motionEpoch++;motionAuto=true;$('motion-error').textContent='';render();await applyMotion(motionReading)};
+$('motion-auto').onchange=async()=>{if(!$('motion-auto').checked){disableMotion();renderMotion();return;}if(!requireConnection()){disableMotion();return;}if(!motionFresh()||(!demo&&!m5State.connected)){disableMotion();toast('M5StickS3を接続し、加速度を受信してください');return;}disableDistance();sensorAuto=false;motionEpoch++;motionAuto=true;$('motion-error').textContent='';render();await applyMotion(motionReading)};
 for(const [id,key] of [['motion-scale-input','fullScale'],['motion-cool-max','coolMax'],['motion-warm-max','warmMax']]){
   $(id).value=String(motionConfig[key]);
   $(id).onchange=async()=>{const next={...motionConfig,[key]:Number($(id).value)};try{validateMotionConfig(next);motionConfig=next;storage.set('reon-motion-config',motionConfig);motionEpoch++;renderMotion();if(motionAuto&&motionFresh())await applyMotion(motionReading)}catch(error){$(id).value=String(motionConfig[key]);toast(error.message)}};
@@ -175,12 +213,12 @@ function motionDemoSample(){const value=Number($('motion-demo-input').value);$('
 $('motion-demo-input').oninput=()=>{if(demo)receiveMotion(motionDemoSample())};
 m5.onState(s=>{const previous=m5State;m5State=s;if(!demo){if(s.reading&&s.reading!==previous.reading){$('motion-error').textContent='';receiveMotion(s.reading);}if(previous.connected&&!s.connected){motionReading=null;if(motionAuto){stop('M5StickS3の接続が切れたため停止');$('motion-error').textContent='M5StickS3との接続が切れたため停止しました';}}renderMotion();}});
 setInterval(()=>{if(motionAuto&&!motionFresh()){stop('加速度が1.5秒更新されないため停止');$('motion-error').textContent='加速度の更新が途絶えたため停止しました';}renderMotion();},250);
-function endDemo(){clearInterval(demoTimer);clearInterval(motionDemoTimer);motionDemoTimer=null;demoTimer=null;demo=false;sensorAuto=false;disableMotion();motionReading=m5State.reading;running=false;reading=null;render();log('デモ終了')}
-$('demo').onclick=async()=>{if(demo){endDemo();return;}if(state.connected){await stop('デモへ切り替え');client.disconnect();}stopPolling();disableMotion();demo=true;running=false;sensorAuto=false;source='tag';await acceptReading({temperature:28.4,humidity:62,time:Date.now()});demoTimer=setInterval(()=>{const temperature=+(28.5+Math.sin(Date.now()/15000)*1.9).toFixed(1);acceptReading({temperature,humidity:62,time:Date.now()})},2000);await receiveMotion(motionDemoSample());motionDemoTimer=setInterval(()=>receiveMotion(motionDemoSample()),200);log('デモ開始');render();toast('デモモード · 実機には送信しません')};
-client.onState(s=>{const wasConnected=state.connected;const previousMode=state.mode;const previousStop=state.lastStop;state=s;if(!demo){running=!!s.connected&&!!s.mode?.running;if(s.connected&&s.mode&&(s.mode!==previousMode||!wasConnected)){if(s.mode.kind==='warm'||s.mode.kind==='cool'){kind=s.mode.kind;level=s.mode.level??s.mode.preference??level;}else if(s.mode.kind==='auto'){kind='cool';level=s.mode.coolPreference??3;}level=Math.min(level,maxLevel());}if(s.tag&&s.tag!==lastTag&&source==='tag'&&s.connected){lastTag=s.tag;acceptReading({temperature:s.tag.temperature,humidity:s.tag.humidity,time:Date.now()});}if(wasConnected&&!s.connected){disableMotion();sensorAuto=false;running=false;log('Bluetooth接続が切れました');toast('Bluetooth接続が切れました');}if(!wasConnected&&s.connected)log('Bluetooth接続完了');if(s.lastStop&&s.lastStop!==previousStop&&s.lastStop.source==='device_report'){log('本体から停止状態を受信（アプリからの停止指示なし）。接続診断を確認してください。');toast('本体が運転を停止しました。接続診断で停止元を確認できます。');}if(s.error&&s.error!==lastError){lastError=s.error;toast(s.error.includes('rejected')?'本体が変更を受け付けませんでした':s.error);}render();}});
+function endDemo(){clearInterval(demoTimer);clearInterval(motionDemoTimer);motionDemoTimer=null;demoTimer=null;demo=false;sensorAuto=false;disableMotion();disableDistance();motionReading=m5State.reading;running=false;reading=null;render();log('デモ終了')}
+$('demo').onclick=async()=>{if(demo){endDemo();return;}if(state.connected){await stop('デモへ切り替え');client.disconnect();}stopPolling();disableMotion();disableDistance();demo=true;running=false;sensorAuto=false;source='tag';await acceptReading({temperature:28.4,humidity:62,time:Date.now()});demoTimer=setInterval(()=>{const temperature=+(28.5+Math.sin(Date.now()/15000)*1.9).toFixed(1);acceptReading({temperature,humidity:62,time:Date.now()})},2000);await receiveMotion(motionDemoSample());motionDemoTimer=setInterval(()=>receiveMotion(motionDemoSample()),200);log('デモ開始');render();toast('デモモード · 実機には送信しません')};
+client.onState(s=>{const wasConnected=state.connected;const previousMode=state.mode;const previousStop=state.lastStop;state=s;if(!demo){running=!!s.connected&&!!s.mode?.running;if(s.connected&&s.mode&&(s.mode!==previousMode||!wasConnected)){if(s.mode.kind==='warm'||s.mode.kind==='cool'){kind=s.mode.kind;level=s.mode.level??s.mode.preference??level;}else if(s.mode.kind==='auto'){kind='cool';level=s.mode.coolPreference??3;}level=Math.min(level,maxLevel());}if(s.tag&&s.tag!==lastTag&&source==='tag'&&s.connected){lastTag=s.tag;acceptReading({temperature:s.tag.temperature,humidity:s.tag.humidity,time:Date.now()});}if(wasConnected&&!s.connected){disableDistance();disableMotion();sensorAuto=false;running=false;log('Bluetooth接続が切れました');toast('Bluetooth接続が切れました');}if(!wasConnected&&s.connected)log('Bluetooth接続完了');if(s.lastStop&&s.lastStop!==previousStop&&s.lastStop.source==='device_report'){disableDistance();log('本体から停止状態を受信（アプリからの停止指示なし）。接続診断を確認してください。');toast('本体が運転を停止しました。接続診断で停止元を確認できます。');}if(s.error&&s.error!==lastError){lastError=s.error;toast(s.error.includes('rejected')?'本体が変更を受け付けませんでした':s.error);}render();}});
 setInterval(()=>{if(reading&&Date.now()-reading.time>30000&&sensorAuto){stop('センサー更新が30秒途絶えたため停止');toast('センサー更新が途絶えたため停止しました')}renderSensor()},1000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){if(reading&&Date.now()-reading.time>30000&&sensorAuto)stop('センサー値の期限切れで停止');if(motionAuto&&!motionFresh())stop('加速度の期限切れで停止')}});
-window.addEventListener('pagehide',()=>{disableMotion();stopPolling();m5.disconnect();if(state.connected)client.disconnect()});
+window.addEventListener('pagehide',()=>{disableDistance();disableMotion();stopPolling();m5.disconnect();if(state.connected)client.disconnect()});
 const browserProblem=bluetoothProblem();$('browser-notice').hidden=!browserProblem;if(browserProblem)$('browser-notice').textContent=browserProblem;
 render();
 

@@ -1,0 +1,26 @@
+const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
+const fs=require('node:fs'),assert=require('node:assert/strict');
+(async()=>{const browser=await chromium.launch({channel:'chrome',headless:true});try{
+ const page=await browser.newPage({viewport:{width:390,height:900}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
+ const mock=fs.readFileSync('tests/mock-device.js','utf8').replace('../dist/protocol.js','/protocol.js');
+ await page.route('**/qa/mock-device.js',route=>route.fulfill({contentType:'text/javascript',body:mock}));
+ await page.addInitScript(()=>Object.defineProperty(navigator,'bluetooth',{configurable:true,value:{requestDevice:async()=>{if(!window.qaHardware){const {mockDevice}=await import('/qa/mock-device.js');window.qaHardware=mockDevice(window,{autoStart:true});}return window.qaHardware.device;}}}));
+ let score=0,fresh=true,personCount=2,holding=false;
+ await page.route('**/api/distance/0123456789abcdef0123456789abcdef',route=>route.fulfill({contentType:'application/json',body:JSON.stringify({schemaVersion:1,score,personCount,holding,holdRemainingMs:holding?1000:0,fresh,timestamp:new Date().toISOString()})}));
+ await page.goto('http://127.0.0.1:4173/');await page.click('#connect');await page.waitForFunction(()=>document.getElementById('connection-state').textContent==='接続済み');
+ await page.selectOption('#distance-source','remote');await page.fill('#distance-api-url','/api/distance/0123456789abcdef0123456789abcdef');await page.check('#distance-enabled');
+ await page.waitForFunction(()=>document.getElementById('distance-output').textContent==='冷却 5');await page.check('#distance-auto');
+ const waitOutput=text=>page.waitForFunction(text=>document.getElementById('output-status').textContent===text,text);
+ await waitOutput('冷却 5');assert.deepEqual(await page.evaluate(()=>qaHardware.writes.filter(x=>['autoStart','mode'].includes(x.name)).map(x=>x.name)),['autoStart','mode']);
+ score=25;await waitOutput('冷却 3');score=50;await waitOutput('停止');assert.ok(await page.isChecked('#distance-auto'));
+ score=75;await waitOutput('温熱 2');score=100;personCount=0;await waitOutput('温熱 4');
+ const count=await page.evaluate(()=>qaHardware.writes.length);await page.waitForTimeout(1300);assert.equal(await page.evaluate(()=>qaHardware.writes.length),count);
+ score=0;personCount=1;holding=true;await waitOutput('冷却 5');holding=false;score=100;await waitOutput('温熱 4');
+ await page.uncheck('#distance-enabled');await waitOutput('停止');assert.equal(await page.isChecked('#distance-auto'),false);
+ await page.check('#distance-enabled');await page.waitForTimeout(1100);assert.equal(await page.textContent('#output-status'),'停止');await page.check('#distance-auto');await waitOutput('温熱 4');
+ await page.getByRole('button',{name:'冷却2',exact:true}).click();await waitOutput('冷却 2');assert.equal(await page.isChecked('#distance-auto'),false);await page.waitForTimeout(1100);assert.equal(await page.textContent('#output-status'),'冷却 2');
+ await page.check('#distance-auto');await waitOutput('温熱 4');fresh=false;await waitOutput('停止');assert.equal(await page.isChecked('#distance-auto'),false);
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);assert.deepEqual(errors,[]);
+ fs.mkdirSync('.sites-runtime/qa',{recursive:true});await page.screenshot({path:'.sites-runtime/qa/reon-distance-output-390.png',fullPage:true});
+ console.log('Passed: shared-distance polling drives fake BLE through 0/25/50/75/100, hold and zero people; duplicate output skipped; OFF/stale stops and disarms; manual override; mobile layout; no page errors.');
+}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});
