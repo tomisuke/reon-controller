@@ -1,0 +1,20 @@
+M5StickS3 Motion — build verification
+Date: 2026-10-21 (Japan)
+
+PlatformIO Core: 6.2.0
+Platform: espressif32 6.12.0
+Board: esp32-s3-devkitc-1 (M5Stack StickS3 documented configuration)
+Arduino ESP32: 2.0.17 / framework-arduinoespressif32 3.20017.241212+sha.dcc1105b
+M5Unified: 0.2.27 / 35903583211e1f39ca88920714525fbcd1eb714a
+M5PM1: 1.0.7 / be9a5456c007c333e7ac963f33bfde1ffa5d82ee
+M5GFX: 0.2.34
+
+Command: pio run -j 2
+Result: SUCCESS
+RAM: 48,056 / 327,680 bytes
+Flash: 1,139,709 / 3,342,336 bytes
+
+This archive contains the source and PlatformIO configuration.
+Run `pio run -t upload` to build and upload to your selected M5StickS3.
+Actual M5StickS3 hardware, radio reception, and REON temperature response
+were not tested in this environment.

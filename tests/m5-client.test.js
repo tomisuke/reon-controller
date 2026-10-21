@@ -1,0 +1,12 @@
+import {test,expect,beforeEach,afterEach} from 'bun:test';
+import {Window} from 'happy-dom';
+import {M5Client} from '../dist/m5-client.js';
+import {mockM5,motionPacket} from './mock-m5.js';
+let window,hardware;
+beforeEach(()=>{window=new Window({url:'http://localhost'});globalThis.window=window;hardware=mockM5(window);Object.defineProperty(globalThis,'navigator',{configurable:true,value:{bluetooth:{requestDevice:async()=>hardware.device}}})});
+afterEach(()=>window.happyDOM.abort());
+test('M5 connects with the dedicated service and receives initial value',async()=>{const client=new M5Client();await client.connect();expect(client.state.connected).toBe(true);expect(client.state.name).toBe('M5StickS3-REON');expect(client.state.reading.motion).toBe(0);expect(hardware.calls).toEqual(['subscribe'])});
+test('M5 accepts notifications and ignores duplicate sequence',async()=>{const client=new M5Client();await client.connect();hardware.emit({z:2,sequence:1});expect(client.state.reading.motion).toBe(1);hardware.emit({z:1,sequence:1});expect(client.state.reading.motion).toBe(1)});
+test('malformed M5 data does not refresh the last valid timestamp',async()=>{const client=new M5Client();await client.connect();const previous=client.state.reading;hardware.emitRaw(motionPacket({flags:0}));expect(client.state.reading).toBe(previous);expect(client.state.error).toContain('無効')});
+test('disconnect invalidates the reading',async()=>{const client=new M5Client();await client.connect();hardware.device.gatt.disconnect();expect(client.state.connected).toBe(false);expect(client.state.reading).toBeNull()});
+test('no notifications support fails cleanly',async()=>{hardware.characteristic.properties.notify=false;const client=new M5Client();await client.connect();expect(client.state.connected).toBe(false);expect(client.state.error).toContain('NotSupportedError')});
