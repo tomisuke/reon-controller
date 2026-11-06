@@ -3,6 +3,7 @@ import {
   DEVICE_INFO,
   SERVICE,
   parseAutomation,
+  automationFrame,
   parseBattery,
   parseCapabilities,
   parseMode,
@@ -80,6 +81,8 @@ export class ReonClient {
   #pollTimer = null;
   #refreshing = false;
   #unreadable = new Set();
+  #manualControlReady = false;
+  #lastModeCommand = null;
   #canRead(name) { return readable(this.#characteristics[name]) && !this.#unreadable.has(name); }
   #stopPolling() { if (this.#pollTimer !== null) window.clearInterval(this.#pollTimer); this.#pollTimer = null; }
   #onDisconnect = (event) => {
@@ -87,6 +90,8 @@ export class ReonClient {
     this.#stopPolling();
     this.#connectionAbort?.abort(new DOMException('Connection lost', 'NetworkError'));
     this.#generation++;
+    this.#manualControlReady = false;
+    this.#lastModeCommand = null;
     this.#characteristics = {};
     this.#update({ connected: false, connecting: false, mode: null, tag: null });
   };
@@ -108,6 +113,8 @@ export class ReonClient {
     error: null,
     connectionDetail: null,
     connectionWarnings: [],
+    manualControl: null,
+    lastStop: null,
   };
 
   onState(listener) {
@@ -141,6 +148,8 @@ export class ReonClient {
     let selected, stage = this.#device ? 'connecting' : 'selecting', operationName = 'requestDevice';
     const properties = {}, info = {}, warnings = [], polling = new Set(), subscribedNames = new Set();
     this.#unreadable.clear();
+    this.#manualControlReady = false;
+    this.#lastModeCommand = null;
     let timeout = setTimeout(() => controller.abort(new DOMException('Device chooser timed out', 'TimeoutError')), 45000);
     const step = (operation, nextStage = stage, label = nextStage, discard) => {
       stage = nextStage;
@@ -160,7 +169,7 @@ export class ReonClient {
         } catch (error) { controller.signal.removeEventListener('abort', abort); reject(error); }
       });
     };
-    this.#update({ connecting: true, connectionStage: stage, error: null, connectionDetail: null, connectionWarnings: [] });
+    this.#update({ connecting: true, connectionStage: stage, error: null, connectionDetail: null, connectionWarnings: [], manualControl:null, lastStop:null });
     try {
       selected = this.#device ?? await step(() => navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: "RNP-" }],
@@ -308,7 +317,40 @@ export class ReonClient {
   }
 
   writeAutomation(name, frame) {
+    if (name === 'autoStart') this.#manualControlReady = false;
     return this.#write(name, frame);
+  }
+
+  async #prepareManualControl(generation) {
+    if (this.#manualControlReady && this.state.autoStart !== true) return;
+    const characteristic = this.#characteristics.autoStart;
+    if (!characteristic) return;
+    const before = this.state.autoStart;
+    const fail = message => Object.assign(new Error('AUTO START/STOPを無効にできないため、運転を開始しませんでした。'+message),{name:'ManualControlError'});
+    if (!writable(characteristic)) {
+      if (before === false) { this.#manualControlReady = true; return; }
+      throw fail('本体の設定を確認してください。');
+    }
+    // This is the wear-detection setting, not a thermal protection override.
+    this.#log('write','autoStart',automationFrame(false));
+    try { await writeCharacteristic(characteristic,automationFrame(false)); }
+    catch (error) { throw fail(error.message); }
+    if (generation !== this.#generation) return;
+    let verified = false;
+    if (this.#canRead('autoStart')) {
+      try {
+        const value = await this.#read('autoStart');
+        if (value.byteLength < 1 || parseAutomation(value)) throw fail('無効化後も本体がONを報告しています。');
+        verified = true;
+      } catch (error) {
+        if (!optionalUnsupported(error)) throw error.name==='ManualControlError'?error:fail(error.message);
+        this.#unreadable.add('autoStart');
+      }
+    }
+    if (generation !== this.#generation) return;
+    this.#manualControlReady = true;
+    const manualControl = {autoStartBefore:before,autoStartDisabled:true,readBackVerified:verified,updatedAt:new Date().toISOString()};
+    this.#update({autoStart:verified?false:null,manualControl,connectionDetail:{...this.state.connectionDetail,manualControl}});
   }
 
   async linkTag() {
@@ -387,7 +429,13 @@ export class ReonClient {
   #applyValues(values) {
     const patch = {};
     for (const [name, value] of values) {
-      if (name === "mode") patch.mode = parseMode(value);
+      if (name === "mode") {
+        patch.mode = parseMode(value);
+        if (this.state.connected && this.state.mode?.running && patch.mode && !patch.mode.running) {
+          patch.lastStop = {time:new Date().toISOString(),source:this.#lastModeCommand?.running===false?'app_command':'device_report',autoStart:this.state.autoStart,manualControl:this.state.manualControl};
+          patch.connectionDetail = {...this.state.connectionDetail,lastStop:patch.lastStop};
+        }
+      }
       if (name === "battery") patch.battery = parseBattery(value);
       if (name === "temperature") {
         const sensor = parseTemperature(value);
@@ -410,16 +458,24 @@ export class ReonClient {
       .then(async () => {
         if (guard && !guard()) return null;
         if (generation !== this.#generation || !this.#characteristics[name]) return false;
+        const requestedMode = name==='mode'?parseMode(frame):null;
+        if (requestedMode?.type==='manual' && requestedMode.running) await this.#prepareManualControl(generation);
+        if (guard && !guard()) return null;
+        if (generation !== this.#generation || !this.#characteristics[name]) return false;
+        if (this.state.error) this.#update({error:null});
+        if (requestedMode) this.#lastModeCommand = requestedMode;
         this.#log("write", name, frame);
         await writeCharacteristic(this.#characteristics[name], frame);
+        if (generation !== this.#generation) return false;
         if (readBack && this.#canRead(name)) {
           this.#applyValues([[name, await this.#read(name)]]);
         }
         return true;
       })
       .catch((error) => {
+        if (generation !== this.#generation) return false;
         this.#update({
-          error: "The device rejected that change. Reconnect and try again.",
+          error: error.name==='ManualControlError'?error.message:"The device rejected that change. Reconnect and try again.",
         });
         this.#log("error", error.name, new TextEncoder().encode(error.message));
         return false;

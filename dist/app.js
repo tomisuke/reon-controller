@@ -1,41 +1,41 @@
 import {ReonClient} from './reon-client.js';
-import {THERMO,manualFrame,stopFrame,smartFrame,smartStopFrame,automationFrame,parseMode} from './protocol.js';
+import {THERMO,manualFrame,stopFrame,smartStopFrame,parseMode} from './protocol.js';
 import {DEFAULT_RULES,evaluateRules,validateRules,parseReading} from './sensor.js';
 import {bluetoothProblem} from './bluetooth-environment.js';
 import {M5Client} from './m5-client.js';
 import {DEFAULT_MOTION_CONFIG,MOTION_STALE_MS,validateMotionConfig,motionOutput} from './motion.js';
+import {distanceSample,scoreToRatio,calibratedOutput,calibrationSample,validCalibration,estimateCm,median,CALIBRATION} from './distance-output.js';
 const $=id=>document.getElementById(id);
 const client=new ReonClient();
 const m5=new M5Client();
 const storage={get(key,fallback){try{return JSON.parse(localStorage.getItem(key))??fallback}catch{return fallback}},set(key,value){try{localStorage.setItem(key,JSON.stringify(value))}catch{}}};
 let motionConfig=storage.get('reon-motion-config',DEFAULT_MOTION_CONFIG);try{validateMotionConfig(motionConfig)}catch{motionConfig={...DEFAULT_MOTION_CONFIG}}
 let motionAuto=false,motionEpoch=0,motionReading=null,m5State=m5.state,motionDemoTimer=null;
+let distanceAuto=false,distanceEpoch=0,distanceReading=null,distanceReceivedAt=0,distanceJob=null,distanceSending=false,distanceApplied=null;
+const CALIBRATION_KEY='reon-distance-calibration-v1',emptyCalibration=()=>({near:null,far:null,nearAt:null,farAt:null});
+let distanceCalibration=(()=>{const c=storage.get(CALIBRATION_KEY,null),point=v=>Number.isFinite(v)&&v>=0&&v<=1?v:null;return c?{near:point(c.near),far:point(c.far),nearAt:c.nearAt??null,farAt:c.farAt??null}:emptyCalibration()})(),calibrating=null;
 let rules=storage.get('reon-glass-rules',DEFAULT_RULES);try{validateRules(rules)}catch{rules=structuredClone(DEFAULT_RULES)}
-let demo=false,kind='cool',level=3,running=false,smartKind='cool',sensorAuto=false,source='tag',reading=null,history=[],samples=[],pending=false;
-let pollController=null,pollTimer=null,pollGeneration=0,demoTimer=null,timerDeadline=0,lastTag=null,toastTimer,lastError=null;
+let demo=false,kind='cool',level=3,running=false,sensorAuto=false,source='tag',reading=null,pending=false;
+let pollController=null,pollTimer=null,pollGeneration=0,demoTimer=null,lastTag=null,toastTimer,lastError=null;
 let state=client.state;
-const demoCaps={coolLevels:5,warmLevels:3,smart:true,wave:true,autoStart:true,quickLaunch:true,environmentalSensor:true};
+const demoCaps={coolLevels:5,warmLevels:4,environmentalSensor:true};
 const caps=()=>demo?demoCaps:state.capabilities;
 const ready=()=>demo||state.connected;
-const maxLevel=()=>kind==='smart'?5:kind==='warm'?(caps()?.warmLevels??3):(caps()?.coolLevels??5);
+const maxLevel=()=>kind==='warm'?(caps()?.warmLevels??3):(caps()?.coolLevels??5);
 const clock=time=>new Date(time).toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
-function log(message){history.unshift({time:Date.now(),message});history=history.slice(0,100);renderHistory()}
+function log(message){$('last-action').textContent=message;}
 function toast(message){$('toast').textContent=message;$('toast').classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').classList.remove('visible'),4000)}
-function skeleton(on){$('skeleton').classList.toggle('loaded',!on);$('main').setAttribute('aria-busy',String(on))}
 function closeDialogs(){document.querySelectorAll('dialog[open]').forEach(d=>d.close())}
-function openDialog(id){closeDialogs();if(id==='rules-dialog')renderRules();if(id==='history-dialog')renderHistory();$(id).showModal()}
+function openDialog(id){closeDialogs();if(id==='rules-dialog')renderRules();$(id).showModal()}
 document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>openDialog(b.dataset.open));
 document.querySelectorAll('.close-dialog').forEach(b=>b.onclick=()=>b.closest('dialog').close());
 document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d){const r=d.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)d.close()}}));
-document.querySelectorAll('[data-nav]').forEach(b=>b.onclick=()=>{if(b.dataset.nav==='history')return openDialog('history-dialog');document.querySelectorAll('[data-nav]').forEach(n=>n.classList.toggle('active',n.dataset.nav===b.dataset.nav));(b.dataset.nav==='sensors'?$('sensor-section'):$('main')).scrollIntoView({behavior:'smooth',block:'start'});if(b.dataset.nav==='sensors'&&!reading)openDialog('sensor-dialog')});
-function animateNumber(){const n=$('level-number');n.classList.remove('bump');void n.offsetWidth;n.classList.add('bump')}
 function render(){
-  const connected=ready(),c=caps(),m=demo?null:state.mode;
+  const connected=ready(),c=caps();
   document.body.classList.toggle('warm',kind==='warm');
   $('connect-label').textContent=state.connecting?'キャンセル':demo?'実機を接続':state.connected?'接続を解除':'デバイスを接続';
   $('connect').disabled=false;
   $('demo').disabled=state.connecting;
-  document.querySelectorAll('[data-preset]').forEach(b=>b.disabled=state.connecting);
   $('connection-feedback').hidden=demo||(!state.connecting&&!state.error);
   $('connection-spinner').hidden=!state.connecting;
   $('connection-feedback').classList.toggle('connection-failed',!!state.error);
@@ -45,32 +45,30 @@ function render(){
   $('device-model').textContent=demo?'シミュレーション':state.device&&state.connected?`${state.device.model} · FW ${state.device.firmware}`:'Bluetooth';
   $('demo-label').hidden=!demo;$('demo').textContent=demo?'デモを終了':'デモを試す';
   $('run-status').classList.toggle('running',running&&connected);$('run-status').replaceChildren(Object.assign(document.createElement('span'),{className:'dot'}),document.createTextNode(running&&connected?'運転中':'停止中'));
-  document.querySelectorAll('[data-kind]').forEach(b=>{const selected=b.dataset.kind===kind;b.classList.toggle('selected',selected);b.setAttribute('aria-pressed',String(selected));b.disabled=!!c&&!c.smart&&b.dataset.kind==='smart'});
-  const activeKind=kind==='smart'?smartKind:kind;
-  $('dial-mode').innerHTML=`<svg><use href="#i-${kind==='smart'?'sensor':activeKind==='warm'?'warm':'cool'}"/></svg>${kind==='smart'?'SMART':activeKind==='warm'?'WARM':'COOL'}`;
-  $('level-number').textContent=String(level);$('dial-caption').textContent=kind==='smart'?'温度の好み':kind==='warm'?'温熱レベル':'冷却レベル';
-  $('dial-arc').style.strokeDasharray=`${674*level/maxLevel()} 899`;
-  $('dial-dots').innerHTML=Array.from({length:maxLevel()},(_,i)=>`<i class="${i<level?'on':''}"></i>`).join('');
-  $('level-buttons').innerHTML=Array.from({length:maxLevel()},(_,i)=>`<button data-level="${i+1}" class="${i+1===level?'selected':''}" aria-label="レベル${i+1}" aria-pressed="${i+1===level}">${i+1}</button>`).join('');
-  $('decrease').disabled=level<=1;$('increase').disabled=level>=maxLevel();
+  const actual=demo?{kind,level}:state.mode;
+  $('output-status').textContent=running&&connected?(actual?.type==='smart'?'SMART · ':'')+(actual?.kind==='warm'?'温熱':'冷却')+' '+(actual?.level??actual?.preference??level):connected?'停止':'未接続';
+  for(const outputKind of ['cool','warm']){
+    const count=outputKind==='warm'?(c?.warmLevels??3):(c?.coolLevels??5);
+    const bank=$(outputKind+'-levels');
+    if(bank.children.length!==count)bank.innerHTML=Array.from({length:count},(_,i)=>'<button data-output="'+outputKind+'" data-level="'+(i+1)+'" aria-label="'+(outputKind==='warm'?'温熱':'冷却')+(i+1)+'">'+(i+1)+'</button>').join('');
+    for(const button of bank.children){const selected=kind===outputKind&&Number(button.dataset.level)===level;button.classList.toggle('selected',selected);button.setAttribute('aria-pressed',String(selected&&running&&connected));button.disabled=state.connecting||pending;}
+  }
   $('power').classList.toggle('running',running&&connected);$('power').disabled=pending||state.connecting;
   $('power-label').textContent=state.connecting?'接続待ち…':pending?'送信中…':running&&connected?'運転を停止':connected?'運転を開始':'接続して運転';
   $('battery').textContent=demo?'82%':state.battery&&state.connected?`${state.battery.level}%`: '—';
   $('surface').textContent=demo?`${(running?24.3:28.1).toFixed(1)} °C`:state.temperature&&state.connected?`${state.temperature.surface.toFixed(1)} °C`:'— °C';
-  $('wave').disabled=!connected||!c?.wave||kind==='smart';
-  $('wave-caption').textContent=c&&!c.wave?'この機種は非対応':kind==='smart'?'マニュアル運転で使用':'強弱をつけて運転';
-  $('auto-start').disabled=!connected||!c?.autoStart;$('quick-launch').disabled=!connected||!c?.quickLaunch;
-  if(!demo){$('auto-start').checked=state.autoStart??false;$('quick-launch').checked=state.quickLaunch??false;$('wave').checked=state.mode?.type==='manual'&&!!state.mode.wave;}
   $('sensor-auto').checked=sensorAuto;
   $('link-tag').disabled=!connected||state.pairingTag||c?.tagLink===false;
   $('link-tag').textContent=state.pairingTag?'Tagを検索中…':state.tagLinked&&!demo?'Tagの接続を解除':'Tagを接続';
   $('device-info').textContent=demo?'DEMO · デバイスへの送信は行いません':state.connected?`${state.device?.name??'REON'} · ${state.device?.model??''} · Firmware ${state.device?.firmware??''}`:'デバイス未接続';
+  if(state.manualControl)$('device-info').textContent+=' · 本体の自動開始/停止: '+(state.manualControl.readBackVerified?'無効を確認済み':'無効化を送信済み（読取非対応）');
   $('connection-details').hidden=!state.connectionDetail||demo;
   const diagnostic=state.connectionDetail?JSON.stringify(state.connectionDetail,null,2):'接続履歴はありません';
   $('connection-diagnostic').textContent=diagnostic;$('settings-connection-diagnostic').textContent=demo?'デモモード':diagnostic;
   $('rule-count').textContent=`${rules.length} ルール`;
   renderSensor();
   renderMotion();
+  renderDistanceLink();
 }
 function renderSensor(){
   const valid=reading&&Date.now()-reading.time<=30000;
@@ -82,18 +80,7 @@ function renderSensor(){
   $('rule-temp').replaceChildren(document.createTextNode(valid?reading.temperature.toFixed(1):'—'),Object.assign(document.createElement('small'),{textContent:'°C'}));
   const output=valid?evaluateRules(reading.temperature,rules,caps()??demoCaps):null;
   $('rule-output').textContent=output?output.kind==='stop'?'停止':`${output.kind==='warm'?'温熱':'冷却'} ${output.level}`:'—';
-  renderChart();
 }
-function renderChart(){
-  $('chart-empty').hidden=samples.length>0;
-  if(!samples.length){$('chart-line').setAttribute('d','');$('chart-fill').setAttribute('d','');$('chart-start').textContent='接続待ち';return;}
-  const min=Math.floor(Math.min(...samples.map(s=>s.temperature))-1),max=Math.ceil(Math.max(...samples.map(s=>s.temperature))+1);
-  $('chart-high').textContent=max+'°';$('chart-low').textContent=min+'°';
-  const points=samples.map((s,i)=>[samples.length===1?440:i/(samples.length-1)*440,85-(s.temperature-min)/(max-min)*70]);
-  const d=points.map((p,i)=>`${i?'L':'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
-  $('chart-line').setAttribute('d',d);$('chart-fill').setAttribute('d',`${d} L440,100 L${points[0][0]},100 Z`);$('chart-start').textContent=clock(samples[0].time);
-}
-function renderHistory(){const list=$('history-list');list.replaceChildren();if(!history.length){list.append(Object.assign(document.createElement('div'),{className:'history-empty',textContent:'操作履歴はまだありません'}));return;}for(const h of history){const row=Object.assign(document.createElement('div'),{className:'history-item'});row.append(Object.assign(document.createElement('time'),{textContent:clock(h.time)}),Object.assign(document.createElement('span'),{textContent:h.message}));list.append(row)}}
 function requireConnection(){if(ready())return true;toast('デバイスを接続してください');return false}
 async function write(frame,message,guard){
   if(!ready())return false;
@@ -101,67 +88,128 @@ async function write(frame,message,guard){
   const success=demo?true:await client.writeMode(frame,guard);
   if(success===null)return null;
   if(demo){const m=parseMode(frame);running=m.running;}
-  if(success){if(message)log(message);}else{toast('本体に反映できませんでした。再接続してください');sensorAuto=false;disableMotion();}
+  if(success){if(message)log(message);}else{toast('本体に反映できませんでした。再接続してください');sensorAuto=false;disableMotion();disableDistance();}
   render();return success;
 }
-function currentFrame(){return kind==='smart'?smartFrame(smartKind,level):manualFrame(kind==='warm'?THERMO.warm:THERMO.cool,level,$('wave').checked)}
-async function applyManual(start=false){if(!requireConnection())return false;sensorAuto=false;disableMotion();return write(currentFrame(),`${kind==='smart'?'SMART':kind==='warm'?'温熱':'冷却'} レベル${level}${start?' 開始':''}`)}
-async function stop(reason='運転停止'){sensorAuto=false;disableMotion();timerDeadline=0;$('timer').value='0';updateTimer();if(!ready()){running=false;render();return true;}const mode=demo?(kind==='smart'?{type:'smart',kind:smartKind}:null):state.mode;const ok=await write(mode?.type==='smart'?smartStopFrame(mode):stopFrame((mode?.kind??kind)==='warm'?THERMO.warm:THERMO.cool),reason);return ok;}
+function currentFrame(){return manualFrame(kind==='warm'?THERMO.warm:THERMO.cool,level,false)}
+async function applyManual(start=false){if(!requireConnection())return false;sensorAuto=false;disableMotion();disableDistance();return write(currentFrame(),`${kind==='warm'?'温熱':'冷却'} レベル${level}${start?' 開始':''}`)}
+async function stop(reason='運転停止'){sensorAuto=false;disableMotion();disableDistance();if(!ready()){running=false;render();return true;}const mode=demo?null:state.mode;const ok=await write(mode?.type==='smart'?smartStopFrame(mode):stopFrame((mode?.kind??kind)==='warm'?THERMO.warm:THERMO.cool),reason);return ok;}
 async function connect(start=false){
   if(state.connecting)return false;
-  const requested={kind,level,smartKind,wave:$('wave').checked};
+  const requested={kind,level};
   if(demo)endDemo();
-  await client.connect();if(!state.connected)return false;if(start){kind=requested.kind;smartKind=requested.smartKind;if(kind==='smart'&&!caps()?.smart)kind=smartKind;level=Math.min(requested.level,maxLevel());$('wave').checked=requested.wave&&!!caps()?.wave;await applyManual(true);}return true;
+  await client.connect();if(!state.connected)return false;if(start){kind=requested.kind;level=Math.min(requested.level,maxLevel());await applyManual(true);}return true;
 }
 $('connect').onclick=async()=>{if(state.connecting){client.cancelConnection();return;}if(state.connected){await stop('接続を解除');client.disconnect();}else await connect()};
 $('app-url').value=window.location.origin+window.location.pathname;
 document.querySelectorAll('[data-copy-diagnostics]').forEach(button=>button.onclick=async()=>{if(!state.connectionDetail){toast('接続履歴はありません');return;}try{await navigator.clipboard.writeText(JSON.stringify(state.connectionDetail,null,2));toast('接続の詳細をコピーしました')}catch{toast('接続の詳細を開き、テキストを選択してコピーしてください')}});
 $('copy-url').onclick=async()=>{try{await navigator.clipboard.writeText($('app-url').value);toast('URLをコピーしました。Chrome / Edgeなどの対応ブラウザで開いてください。')}catch{$('app-url').focus();$('app-url').select();toast('URLを選択しました。コピーして対応ブラウザで開いてください。')}};
 $('power').onclick=async()=>{if(pending)return;if(running&&ready())return stop();if(!ready())return connect(true);pending=true;render();try{await applyManual(true)}finally{pending=false;render()}};
-document.querySelectorAll('[data-kind]').forEach(b=>b.onclick=async()=>{disableMotion();smartKind=kind==='warm'?'warm':'cool';kind=b.dataset.kind;level=Math.min(level,maxLevel());sensorAuto=false;render();animateNumber();if(running&&ready())await applyManual()});
-async function chooseLevel(n){disableMotion();level=Math.max(1,Math.min(maxLevel(),n));sensorAuto=false;render();animateNumber();if(ready())await applyManual(true);else toast('接続後、このレベルで運転します')}
-$('level-buttons').onclick=e=>{const b=e.target.closest('[data-level]');if(b)chooseLevel(Number(b.dataset.level))};
-$('decrease').onclick=()=>chooseLevel(level-1);$('increase').onclick=()=>chooseLevel(level+1);
-document.querySelectorAll('[data-preset]').forEach(b=>b.onclick=async()=>{disableMotion();kind='cool';level=b.dataset.preset==='quiet'?1:b.dataset.preset==='strong'?(caps()?.coolLevels??5):Math.min(3,caps()?.coolLevels??5);sensorAuto=false;render();animateNumber();if(ready())await applyManual(true);else await connect(true);document.querySelectorAll('[data-preset]').forEach(p=>p.classList.toggle('selected',p===b));$('preset-label').textContent=b.textContent+' · 冷却レベル'+level});
-$('wave').onchange=()=>{if(running&&ready())applyManual()};
-for(const [id,name] of [['auto-start','autoStart'],['quick-launch','quickLaunch']])$(id).onchange=async()=>{if(!requireConnection())return;const value=$(id).checked;if(demo){log(`${id==='auto-start'?'オートスタート':'クイック起動'} ${value?'オン':'オフ'}`);return;}if(await client.writeAutomation(name,automationFrame(value)))toast('設定を反映しました');else toast('設定を反映できませんでした');render()};
+async function chooseOutput(outputKind,outputLevel){
+  if(state.connecting||pending)return;
+  disableMotion();disableDistance();sensorAuto=false;kind=outputKind;level=Math.max(1,Math.min(maxLevel(),outputLevel));render();
+  if(ready())await applyManual(true);else await connect(true);
+}
+for(const id of ['cool-levels','warm-levels'])$(id).onclick=e=>{const b=e.target.closest('[data-output]');if(b)chooseOutput(b.dataset.output,Number(b.dataset.level));};
 $('reduce-motion').checked=storage.get('reon-glass-reduced-motion',false);document.body.classList.toggle('motion-reduced',$('reduce-motion').checked);
 $('reduce-motion').onchange=()=>{document.body.classList.toggle('motion-reduced',$('reduce-motion').checked);storage.set('reon-glass-reduced-motion',$('reduce-motion').checked)};
-$('reload-skeleton').onclick=()=>{closeDialogs();skeleton(true);setTimeout(()=>skeleton(false),1200)};
-$('clear-history').onclick=()=>{history=[];renderHistory()};
-function updateTimer(){if(timerDeadline){const remaining=Math.max(0,Math.ceil((timerDeadline-Date.now())/1000));$('timer-label').textContent=`残り ${Math.floor(remaining/60)}:${String(remaining%60).padStart(2,'0')}`;if(!remaining){timerDeadline=0;stop('オフタイマーで停止');toast('タイマーで停止しました')}}else $('timer-label').textContent='未設定'}
-$('timer').onchange=()=>{const minutes=Number($('timer').value);if(minutes&&!running){$('timer').value='0';toast('運転を開始してから設定してください');return;}timerDeadline=minutes?Date.now()+minutes*60000:0;log(minutes?`オフタイマー ${minutes}分`:'オフタイマー解除');updateTimer()};
 function setSource(value){document.querySelectorAll('[data-source]').forEach(b=>b.classList.toggle('selected',b.dataset.source===value));$('tag-panel').hidden=value!=='tag';$('api-panel').hidden=value!=='api'}
 document.querySelectorAll('[data-source]').forEach(b=>b.onclick=()=>setSource(b.dataset.source));
-$('link-tag').onclick=async()=>{if(!requireConnection())return;if(demo){toast('デモではTagを接続しません');return;}if(!state.tagLinked&&!(typeof BluetoothDevice!=='undefined'&&'watchAdvertisements' in BluetoothDevice.prototype)){ $('sensor-message').textContent='このブラウザはTag広告の読み取りに対応していません。JSON APIを利用してください。';return;}stopPolling();source='tag';reading=null;samples=[];lastTag=null;if(sensorAuto)await stop('Tag変更で停止');sensorAuto=false;await (state.tagLinked?client.unlinkTag():client.linkTag());$('sensor-message').textContent=state.error??(state.tagLinked?'接続済み · センサー値の受信待ち':'Tagの接続を解除しました');render()};
+$('link-tag').onclick=async()=>{if(!requireConnection())return;if(demo){toast('デモではTagを接続しません');return;}if(!state.tagLinked&&!(typeof BluetoothDevice!=='undefined'&&'watchAdvertisements' in BluetoothDevice.prototype)){ $('sensor-message').textContent='このブラウザはTag広告の読み取りに対応していません。JSON APIを利用してください。';return;}stopPolling();source='tag';reading=null;lastTag=null;if(sensorAuto)await stop('Tag変更で停止');sensorAuto=false;await (state.tagLinked?client.unlinkTag():client.linkTag());$('sensor-message').textContent=state.error??(state.tagLinked?'接続済み · センサー値の受信待ち':'Tagの接続を解除しました');render()};
 function stopPolling(){pollGeneration++;if(pollTimer!==null)clearTimeout(pollTimer);pollTimer=null;pollController?.abort();pollController=null;}
-async function acceptReading(value){reading=value;samples.push(value);samples=samples.slice(-90);renderSensor();if(sensorAuto&&ready())await applySensor(value)}
+async function acceptReading(value){reading=value;renderSensor();if(sensorAuto&&ready())await applySensor(value)}
 async function applySensor(value){
   const action=evaluateRules(value.temperature,rules,caps()??demoCaps);
   // No hysteresis, cooldown, smoothing or debounce: evaluate and send every reading.
   if(action.kind==='stop'){
-    const mode=demo?{type:kind==='smart'?'smart':'manual',kind:kind==='smart'?smartKind:kind}:state.mode;
+    const mode=demo?{type:'manual',kind}:state.mode;
     await write(mode?.type==='smart'?smartStopFrame(mode):stopFrame(mode?.kind==='warm'?THERMO.warm:THERMO.cool),`センサー ${value.temperature.toFixed(1)}°C → 停止`);
   }else{kind=action.kind;level=action.level;await write(manualFrame(kind==='warm'?THERMO.warm:THERMO.cool,level,false),`センサー ${value.temperature.toFixed(1)}°C → ${kind==='warm'?'温熱':'冷却'} ${level}`);}
   render();
 }
-$('sensor-auto').onchange=async()=>{if(!$('sensor-auto').checked){sensorAuto=false;render();log('センサー連動オフ');return;}if(!requireConnection()){$('sensor-auto').checked=false;return;}if(!reading||Date.now()-reading.time>30000){$('sensor-auto').checked=false;toast('有効なセンサー値が必要です');openDialog('sensor-dialog');return;}disableMotion();sensorAuto=true;await applySensor(reading);render()};
+$('sensor-auto').onchange=async()=>{if(!$('sensor-auto').checked){sensorAuto=false;render();log('センサー連動オフ');return;}if(!requireConnection()){$('sensor-auto').checked=false;return;}if(!reading||Date.now()-reading.time>30000){$('sensor-auto').checked=false;toast('有効なセンサー値が必要です');openDialog('sensor-dialog');return;}disableMotion();disableDistance();sensorAuto=true;await applySensor(reading);render()};
 $('sensor-url').value=storage.get('reon-glass-sensor-url','');$('poll-interval').value=storage.get('reon-glass-poll-interval','1000');
 $('api-panel').onsubmit=async e=>{e.preventDefault();let url;try{url=new URL($('sensor-url').value);if(url.protocol!=='https:'&&!(url.protocol==='http:'&&['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw Error();if(url.username||url.password)throw Error();}catch{$('sensor-message').textContent='認証情報を含まないHTTPS URLを入力してください';return;}
-  if(demo)endDemo();stopPolling();source='api';reading=null;samples=[];sensorAuto=false;const generation=pollGeneration;const interval=Number($('poll-interval').value);storage.set('reon-glass-sensor-url',url.href);storage.set('reon-glass-poll-interval',String(interval));
+  if(demo)endDemo();stopPolling();source='api';reading=null;sensorAuto=false;const generation=pollGeneration;const interval=Number($('poll-interval').value);storage.set('reon-glass-sensor-url',url.href);storage.set('reon-glass-poll-interval',String(interval));
   async function poll(){if(generation!==pollGeneration)return;pollController=new AbortController();const timeout=setTimeout(()=>pollController?.abort(),8000);try{const r=await fetch(url.href,{signal:pollController.signal,cache:'no-store',credentials:'omit'});if(!r.ok)throw Error(`HTTP ${r.status}`);const value=parseReading(await r.json());if(generation!==pollGeneration)return;await acceptReading(value);$('sensor-message').textContent=`${clock(Date.now())} · 接続済み`;lastError=null;}catch(error){if(generation!==pollGeneration)return;$('sensor-message').textContent='取得できません: '+error.message;if(lastError!==error.message){log('センサー取得エラー: '+error.message);lastError=error.message;}}finally{clearTimeout(timeout);if(generation===pollGeneration){pollTimer=setTimeout(poll,interval);renderSensor()}}}
   pollTimer=0;render();await poll();
 };
-$('stop-api').onclick=async()=>{stopPolling();reading=null;samples=[];if(sensorAuto)await stop('センサー接続解除で停止');$('sensor-message').textContent='API接続を解除しました';render()};
+$('stop-api').onclick=async()=>{stopPolling();reading=null;if(sensorAuto)await stop('センサー接続解除で停止');$('sensor-message').textContent='API接続を解除しました';render()};
 function renderRules(){const container=$('rule-rows');container.replaceChildren();for(const r of rules)addRuleRow(r);$('rules-error').textContent=''}
 function addRuleRow(r={temperature:35,kind:'cool',level:5}){const row=document.createElement('div');row.className='rule-row';row.innerHTML=`<input type="number" step="0.1" min="-40" max="80" required aria-label="温度以下"><select aria-label="運転"><option value="warm">温熱</option><option value="stop">停止</option><option value="cool">冷却</option></select><input type="number" min="1" max="5" step="1" required aria-label="レベル"><button type="button" aria-label="ルールを削除">×</button>`;const [temp,select,lev]=row.querySelectorAll('input,select');temp.value=r.temperature;select.value=r.kind;lev.value=r.kind==='stop'?1:r.level;lev.disabled=r.kind==='stop';select.onchange=()=>lev.disabled=select.value==='stop';row.querySelector('button').onclick=()=>row.remove();$('rule-rows').append(row)}
 $('add-rule').onclick=()=>{const rows=$('rule-rows').children;const last=rows.length?Number(rows[rows.length-1].querySelector('input').value):30;addRuleRow({temperature:Math.min(80,last+3),kind:'cool',level:5})};
 $('rules-form').onsubmit=async e=>{e.preventDefault();const next=[...$('rule-rows').children].map(row=>{const [t,k,l]=row.querySelectorAll('input,select');return{temperature:Number(t.value),kind:k.value,level:k.value==='stop'?0:Number(l.value)}});try{validateRules(next);rules=next;storage.set('reon-glass-rules',rules);closeDialogs();toast('ルールを保存しました');render();if(sensorAuto&&reading)await applySensor(reading)}catch(error){$('rules-error').textContent=error.message}};
 function motionFresh(sample=motionReading){return !!sample&&Date.now()-sample.time>=0&&Date.now()-sample.time<=MOTION_STALE_MS}
+function distanceRatioNow(){const score=distanceSample(distanceReading,distanceReceivedAt);return score===null?null:scoreToRatio(score,distanceReading?.fullScale??1)}
+function activeCalibration(){return validCalibration(distanceCalibration)?distanceCalibration:null}
+function distanceAction(){const ratio=distanceRatioNow(),c=activeCalibration();return ratio===null||!c?null:calibratedOutput(ratio,c,caps()??demoCaps)}
+const outputKey=action=>action?`${action.kind}:${action.level}`:null;
+const outputLabel=action=>!action?'—':action.kind==='stop'?'停止':`${action.kind==='warm'?'温熱':'冷却'} ${action.level}`;
+function disableDistance(){distanceAuto=false;distanceEpoch++;distanceJob=null;distanceApplied=null;$('distance-auto').checked=false;}
+function renderDistanceLink(){
+  $('distance-auto').checked=distanceAuto;
+  $('distance-output').textContent=outputLabel(distanceAction());
+  $('distance-link-status').textContent=distanceAuto?'距離に連動中':'連動OFF';
+  const c=caps();$('distance-link-note').textContent=c&&(c.coolLevels<CALIBRATION.far.level||c.warmLevels<CALIBRATION.near.level)?`本体の上限に調整：冷却${Math.min(CALIBRATION.far.level,c.coolLevels)} / 温熱${Math.min(CALIBRATION.near.level,c.warmLevels)}`:'';
+  renderCalibration();
+}
+function renderCalibration(){
+  const c=activeCalibration(),ratio=distanceRatioNow(),cm=c?estimateCm(ratio,c):null;
+  $('distance-estimate').textContent=!c?'未キャリブレーション':ratio===null?'—':ratio===Infinity?'2人未満 · 160cm以上として扱う':`約 ${Math.max(0,Math.round(cm))} cm`;
+  for(const point of ['near','far']){const value=distanceCalibration[point];$('distance-calib-'+point+'-value').textContent=calibrating?.point===point?'計測中…':Number.isFinite(value)?`記録済み · 対角線の${(value*100).toFixed(1)}%`:'未記録';$('distance-calib-'+point).disabled=!!calibrating;$('distance-calib-'+point).textContent=Number.isFinite(value)?'記録し直す':'記録する';}
+  $('distance-calib-reset').disabled=!!calibrating||(distanceCalibration.near===null&&distanceCalibration.far===null);
+  $('distance-calib-state').textContent=calibrating?'計測中':c?'完了':distanceCalibration.near!==null?'160cmが未記録':distanceCalibration.far!==null?'80cmが未記録':'未設定';
+  $('distance-calibration').classList.toggle('done',!!c);
+}
+function startCalibration(point){
+  if(calibrating)return;
+  if(calibrationSample(distanceReading)===null){$('distance-calib-message').textContent='距離計測をONにし、2人だけを映した状態で記録してください。';return;}
+  calibrating={point,samples:[],received:0};$('distance-calib-message').textContent=`${CALIBRATION[point].cm}cmを計測中です。3秒間そのまま静止してください。`;
+  setTimeout(finishCalibration,CALIBRATION.windowMs);renderCalibration();
+}
+function finishCalibration(){
+  const job=calibrating;calibrating=null;if(!job)return;
+  const cm=CALIBRATION[job.point].cm;
+  if(job.samples.length<CALIBRATION.minSamples||job.samples.length*2<job.received){$('distance-calib-message').textContent=`${cm}cmを記録できませんでした。2人だけを映し、検出が途切れない状態で再試行してください。`;updateDistanceOutput();return;}
+  const value=median(job.samples),other=job.point==='near'?'far':'near',next={...distanceCalibration,[job.point]:value,[job.point+'At']:new Date(Date.now()).toISOString()};
+  let note='';
+  if(next[other]!==null&&!validCalibration({near:next.near,far:next.far})){next[other]=null;next[other+'At']=null;note=` 80cmと160cmの値が近すぎるか逆転しているため、${CALIBRATION[other].cm}cmの記録を消去しました。立ち位置を確認して記録し直してください。`;}
+  distanceCalibration=next;storage.set(CALIBRATION_KEY,next);
+  $('distance-calib-message').textContent=`${cm}cmを記録しました（${job.samples.length}フレームの中央値）。`+note+(validCalibration(next)?' キャリブレーション完了。':'');
+  updateDistanceOutput();
+}
+$('distance-calib-near').onclick=()=>startCalibration('near');
+$('distance-calib-far').onclick=()=>startCalibration('far');
+$('distance-calib-reset').onclick=()=>{if(calibrating)return;distanceCalibration=emptyCalibration();storage.set(CALIBRATION_KEY,distanceCalibration);$('distance-calib-message').textContent='キャリブレーションを消去しました。';updateDistanceOutput();};
+async function pumpDistance(){
+  if(distanceSending)return;distanceSending=true;
+  try{while(distanceJob){
+    const job=distanceJob;distanceJob=null;
+    const guard=()=>distanceAuto&&distanceEpoch===job.epoch&&ready()&&outputKey(distanceAction())===job.key;
+    if(!guard()||distanceApplied===job.key)continue;
+    const action=job.action,mode=demo?null:state.mode;
+    const frame=action.kind==='stop'?(mode?.type==='smart'?smartStopFrame(mode):stopFrame((mode?.kind??kind)==='warm'?THERMO.warm:THERMO.cool)):manualFrame(action.kind==='warm'?THERMO.warm:THERMO.cool,action.level,false);
+    distanceApplied=null;
+    const success=await write(frame,`距離連動 → ${outputLabel(action)}`,guard);
+    if(success&&guard()){distanceApplied=job.key;if(action.kind!=='stop'){kind=action.kind;level=action.level;}render();}
+  }}finally{distanceSending=false;}
+}
+function updateDistanceOutput(){
+  const action=distanceAction();renderDistanceLink();if(!distanceAuto)return;
+  if(!action){stop(activeCalibration()?'距離計測の停止・更新切れで停止':'キャリブレーション未完了で停止');return;}
+  distanceJob={action,key:outputKey(action),epoch:distanceEpoch};void pumpDistance();
+}
+window.addEventListener('reon-distance',({detail})=>{distanceReading=detail;distanceReceivedAt=Date.now();if(calibrating){calibrating.received++;const sample=calibrationSample(detail);if(sample!==null)calibrating.samples.push(sample);}updateDistanceOutput()});
+$('distance-auto').onchange=()=>{
+  if(!$('distance-auto').checked){if(distanceAuto)void stop('距離連動OFFで停止');return;}
+  if(!requireConnection()||!distanceAction()){disableDistance();renderDistanceLink();if(ready())toast(activeCalibration()?'距離計測をONにし、有効な値を受信してください':'先に80cm・160cmのキャリブレーションを完了してください');return;}
+  sensorAuto=false;disableMotion();distanceEpoch++;distanceAuto=true;distanceApplied=null;render();updateDistanceOutput();
+};
+setInterval(updateDistanceOutput,250);
 function disableMotion(){motionAuto=false;motionEpoch++;if($('motion-auto'))$('motion-auto').checked=false;}
 function renderMotion(){
   const fresh=motionFresh(),sample=fresh?motionReading:null;
-  $('m5-connect-label').textContent=m5State.connecting?'キャンセル':m5State.connected?'接続を解除':'加速度センサーを接続';
+  $('m5-connect-label').textContent=m5State.connecting?'キャンセル':m5State.connected?'接続を解除':'接続';
   $('m5-status').textContent=demo?'デモセンサー':m5State.connecting?'M5StickS3を選択・接続中…':m5State.connected?(fresh?'加速度を受信中':'加速度の更新待ち'):'未接続';
   $('m5-dot').className='dot'+(m5State.connecting?' pending':fresh?' live':'');
   $('motion-mode-label').textContent=motionAuto?'加速度に連動中':'連動オフ';
@@ -170,9 +218,6 @@ function renderMotion(){
   for(const axis of ['x','y','z'])$('motion-'+axis).textContent=sample?sample[axis].toFixed(3):'—';
   const output=sample?motionOutput(sample.motion,motionConfig,caps()??demoCaps):null;
   $('motion-output').textContent=output?output.kind==='stop'?'停止':`${output.kind==='warm'?'温熱':'冷却'} ${output.level}`:'—';
-  $('motion-marker').style.left=(output?output.position*100:0)+'%';
-  $('motion-cool-label').textContent=`静止 · 冷却${Math.min(motionConfig.coolMax,caps()?.coolLevels??5)}`;
-  $('motion-warm-label').textContent=`大きな動き · 温熱${Math.min(motionConfig.warmMax,caps()?.warmLevels??3)}`;
   $('motion-demo').hidden=!demo;
   if(m5State.error&&!demo)$('motion-error').textContent=m5State.error;
 }
@@ -182,7 +227,7 @@ async function applyMotion(sample){
   if(!guard())return;
   const output=motionOutput(sample.motion,motionConfig,caps()??demoCaps);
   if(output.kind==='stop'){
-    const mode=demo?(kind==='smart'?{type:'smart',kind:smartKind}:null):state.mode;
+    const mode=demo?null:state.mode;
     await write(mode?.type==='smart'?smartStopFrame(mode):stopFrame((mode?.kind??kind)==='warm'?THERMO.warm:THERMO.cool),`加速度 ${sample.motion.toFixed(3)}G → 停止`,guard);
   }else{
     kind=output.kind;level=output.level;
@@ -192,7 +237,7 @@ async function applyMotion(sample){
 }
 async function receiveMotion(sample){motionReading=sample;renderMotion();if(motionAuto)await applyMotion(sample)}
 $('m5-connect').onclick=async()=>{if(m5State.connecting){m5.cancel();return;}if(m5State.connected){if(motionAuto)await stop('M5StickS3の接続解除で停止');m5.disconnect();return;}if(demo)endDemo();$('motion-error').textContent='';await m5.connect()};
-$('motion-auto').onchange=async()=>{if(!$('motion-auto').checked){disableMotion();renderMotion();return;}if(!requireConnection()){disableMotion();return;}if(!motionFresh()||(!demo&&!m5State.connected)){disableMotion();toast('M5StickS3を接続し、加速度を受信してください');return;}sensorAuto=false;motionEpoch++;motionAuto=true;$('motion-error').textContent='';render();await applyMotion(motionReading)};
+$('motion-auto').onchange=async()=>{if(!$('motion-auto').checked){disableMotion();renderMotion();return;}if(!requireConnection()){disableMotion();return;}if(!motionFresh()||(!demo&&!m5State.connected)){disableMotion();toast('M5StickS3を接続し、加速度を受信してください');return;}disableDistance();sensorAuto=false;motionEpoch++;motionAuto=true;$('motion-error').textContent='';render();await applyMotion(motionReading)};
 for(const [id,key] of [['motion-scale-input','fullScale'],['motion-cool-max','coolMax'],['motion-warm-max','warmMax']]){
   $(id).value=String(motionConfig[key]);
   $(id).onchange=async()=>{const next={...motionConfig,[key]:Number($(id).value)};try{validateMotionConfig(next);motionConfig=next;storage.set('reon-motion-config',motionConfig);motionEpoch++;renderMotion();if(motionAuto&&motionFresh())await applyMotion(motionReading)}catch(error){$(id).value=String(motionConfig[key]);toast(error.message)}};
@@ -201,15 +246,14 @@ function motionDemoSample(){const value=Number($('motion-demo-input').value);$('
 $('motion-demo-input').oninput=()=>{if(demo)receiveMotion(motionDemoSample())};
 m5.onState(s=>{const previous=m5State;m5State=s;if(!demo){if(s.reading&&s.reading!==previous.reading){$('motion-error').textContent='';receiveMotion(s.reading);}if(previous.connected&&!s.connected){motionReading=null;if(motionAuto){stop('M5StickS3の接続が切れたため停止');$('motion-error').textContent='M5StickS3との接続が切れたため停止しました';}}renderMotion();}});
 setInterval(()=>{if(motionAuto&&!motionFresh()){stop('加速度が1.5秒更新されないため停止');$('motion-error').textContent='加速度の更新が途絶えたため停止しました';}renderMotion();},250);
-function endDemo(){clearInterval(demoTimer);clearInterval(motionDemoTimer);motionDemoTimer=null;demoTimer=null;demo=false;sensorAuto=false;disableMotion();motionReading=m5State.reading;running=false;reading=null;samples=[];timerDeadline=0;$('timer').value='0';$('wave').checked=false;render();updateTimer();log('デモ終了')}
-$('demo').onclick=async()=>{if(demo){endDemo();return;}if(state.connected){await stop('デモへ切り替え');client.disconnect();}stopPolling();disableMotion();demo=true;running=false;sensorAuto=false;timerDeadline=0;$('timer').value='0';samples=[];source='tag';await acceptReading({temperature:28.4,humidity:62,time:Date.now()});demoTimer=setInterval(()=>{const temperature=+(28.5+Math.sin(Date.now()/15000)*1.9).toFixed(1);acceptReading({temperature,humidity:62,time:Date.now()})},2000);await receiveMotion(motionDemoSample());motionDemoTimer=setInterval(()=>receiveMotion(motionDemoSample()),200);log('デモ開始');render();toast('デモモード · 実機には送信しません')};
-client.onState(s=>{const wasConnected=state.connected;const previousMode=state.mode;state=s;if(!demo){running=!!s.connected&&!!s.mode?.running;if(s.connected&&s.mode&&(s.mode!==previousMode||!wasConnected)){if(s.mode.kind==='warm'||s.mode.kind==='cool'){smartKind=s.mode.kind;kind=s.mode.type==='smart'?'smart':s.mode.kind;level=s.mode.level??s.mode.preference??level;}else if(s.mode.kind==='auto'){kind='smart';level=s.mode.coolPreference??3;}level=Math.min(level,maxLevel());}if(s.tag&&s.tag!==lastTag&&source==='tag'&&s.connected){lastTag=s.tag;acceptReading({temperature:s.tag.temperature,humidity:s.tag.humidity,time:Date.now()});}if(wasConnected&&!s.connected){disableMotion();sensorAuto=false;running=false;timerDeadline=0;$('timer').value='0';log('Bluetooth接続が切れました');toast('Bluetooth接続が切れました');}if(!wasConnected&&s.connected)log('Bluetooth接続完了');if(s.error&&s.error!==lastError){lastError=s.error;toast(s.error.includes('rejected')?'本体が変更を受け付けませんでした':s.error);}render();}});
-setInterval(()=>{updateTimer();if(reading&&Date.now()-reading.time>30000&&sensorAuto){stop('センサー更新が30秒途絶えたため停止');toast('センサー更新が途絶えたため停止しました')}renderSensor()},1000);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden){updateTimer();if(reading&&Date.now()-reading.time>30000&&sensorAuto)stop('センサー値の期限切れで停止');if(motionAuto&&!motionFresh())stop('加速度の期限切れで停止')}});
-window.addEventListener('pagehide',()=>{disableMotion();stopPolling();m5.disconnect();if(state.connected)client.disconnect()});
+function endDemo(){clearInterval(demoTimer);clearInterval(motionDemoTimer);motionDemoTimer=null;demoTimer=null;demo=false;sensorAuto=false;disableMotion();disableDistance();motionReading=m5State.reading;running=false;reading=null;render();log('デモ終了')}
+$('demo').onclick=async()=>{if(demo){endDemo();return;}if(state.connected){await stop('デモへ切り替え');client.disconnect();}stopPolling();disableMotion();disableDistance();demo=true;running=false;sensorAuto=false;source='tag';await acceptReading({temperature:28.4,humidity:62,time:Date.now()});demoTimer=setInterval(()=>{const temperature=+(28.5+Math.sin(Date.now()/15000)*1.9).toFixed(1);acceptReading({temperature,humidity:62,time:Date.now()})},2000);await receiveMotion(motionDemoSample());motionDemoTimer=setInterval(()=>receiveMotion(motionDemoSample()),200);log('デモ開始');render();toast('デモモード · 実機には送信しません')};
+client.onState(s=>{const wasConnected=state.connected;const previousMode=state.mode;const previousStop=state.lastStop;state=s;if(!demo){running=!!s.connected&&!!s.mode?.running;if(s.connected&&s.mode&&(s.mode!==previousMode||!wasConnected)){if(s.mode.kind==='warm'||s.mode.kind==='cool'){kind=s.mode.kind;level=s.mode.level??s.mode.preference??level;}else if(s.mode.kind==='auto'){kind='cool';level=s.mode.coolPreference??3;}level=Math.min(level,maxLevel());}if(s.tag&&s.tag!==lastTag&&source==='tag'&&s.connected){lastTag=s.tag;acceptReading({temperature:s.tag.temperature,humidity:s.tag.humidity,time:Date.now()});}if(wasConnected&&!s.connected){disableDistance();disableMotion();sensorAuto=false;running=false;log('Bluetooth接続が切れました');toast('Bluetooth接続が切れました');}if(!wasConnected&&s.connected)log('Bluetooth接続完了');if(s.lastStop&&s.lastStop!==previousStop&&s.lastStop.source==='device_report'){disableDistance();log('本体から停止状態を受信（アプリからの停止指示なし）。接続診断を確認してください。');toast('本体が運転を停止しました。接続診断で停止元を確認できます。');}if(s.error&&s.error!==lastError){lastError=s.error;toast(s.error.includes('rejected')?'本体が変更を受け付けませんでした':s.error);}render();}});
+setInterval(()=>{if(reading&&Date.now()-reading.time>30000&&sensorAuto){stop('センサー更新が30秒途絶えたため停止');toast('センサー更新が途絶えたため停止しました')}renderSensor()},1000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){if(reading&&Date.now()-reading.time>30000&&sensorAuto)stop('センサー値の期限切れで停止');if(motionAuto&&!motionFresh())stop('加速度の期限切れで停止')}});
+window.addEventListener('pagehide',()=>{disableDistance();disableMotion();stopPolling();m5.disconnect();if(state.connected)client.disconnect()});
 const browserProblem=bluetoothProblem();$('browser-notice').hidden=!browserProblem;if(browserProblem)$('browser-notice').textContent=browserProblem;
-for(let i=0;i<41;i++){const angle=(135+i*6.75)*Math.PI/180;const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',170+130*Math.cos(angle));line.setAttribute('y1',170+130*Math.sin(angle));line.setAttribute('x2',170+133*Math.cos(angle));line.setAttribute('y2',170+133*Math.sin(angle));line.setAttribute('stroke','#b7cbe1');line.setAttribute('stroke-width','1');$('dial-ticks').append(line)}
-render();setTimeout(()=>skeleton(false),850);
+render();
 
 
 

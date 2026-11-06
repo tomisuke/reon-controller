@@ -23,7 +23,7 @@ PlatformIOを使用します。VS CodeのPlatformIO拡張、または `python -m
 
 ## 2. ブラウザで2台を接続
 
-1. [REON Controller](https://tomisuke.github.io/reon-controller/) をPCのChrome/Edgeで開きます。
+1. [REON Controller](https://reon-pocket-glass.tomisuke.chatgpt.site/) をPCのChrome/Edgeで開きます。
 2. REON本体を「デバイスを接続」から接続します。
 3. M5StickS3カードの「加速度センサーを接続」を押し、`M5StickS3-REON` を選びます。
 4. X/Y/Zと動きの値が更新されることを確認し、「加速度連動」をオンにします。
