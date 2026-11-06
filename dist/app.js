@@ -4,7 +4,7 @@ import {DEFAULT_RULES,evaluateRules,validateRules,parseReading} from './sensor.j
 import {bluetoothProblem} from './bluetooth-environment.js';
 import {M5Client} from './m5-client.js';
 import {DEFAULT_MOTION_CONFIG,MOTION_STALE_MS,validateMotionConfig,motionOutput} from './motion.js';
-import {distanceOutput,distanceSample} from './distance-output.js';
+import {distanceSample,scoreToRatio,calibratedOutput,calibrationSample,validCalibration,estimateCm,median,CALIBRATION} from './distance-output.js';
 const $=id=>document.getElementById(id);
 const client=new ReonClient();
 const m5=new M5Client();
@@ -12,6 +12,8 @@ const storage={get(key,fallback){try{return JSON.parse(localStorage.getItem(key)
 let motionConfig=storage.get('reon-motion-config',DEFAULT_MOTION_CONFIG);try{validateMotionConfig(motionConfig)}catch{motionConfig={...DEFAULT_MOTION_CONFIG}}
 let motionAuto=false,motionEpoch=0,motionReading=null,m5State=m5.state,motionDemoTimer=null;
 let distanceAuto=false,distanceEpoch=0,distanceReading=null,distanceReceivedAt=0,distanceJob=null,distanceSending=false,distanceApplied=null;
+const CALIBRATION_KEY='reon-distance-calibration-v1',emptyCalibration=()=>({near:null,far:null,nearAt:null,farAt:null});
+let distanceCalibration=(()=>{const c=storage.get(CALIBRATION_KEY,null),point=v=>Number.isFinite(v)&&v>=0&&v<=1?v:null;return c?{near:point(c.near),far:point(c.far),nearAt:c.nearAt??null,farAt:c.farAt??null}:emptyCalibration()})(),calibrating=null;
 let rules=storage.get('reon-glass-rules',DEFAULT_RULES);try{validateRules(rules)}catch{rules=structuredClone(DEFAULT_RULES)}
 let demo=false,kind='cool',level=3,running=false,sensorAuto=false,source='tag',reading=null,pending=false;
 let pollController=null,pollTimer=null,pollGeneration=0,demoTimer=null,lastTag=null,toastTimer,lastError=null;
@@ -138,7 +140,9 @@ function addRuleRow(r={temperature:35,kind:'cool',level:5}){const row=document.c
 $('add-rule').onclick=()=>{const rows=$('rule-rows').children;const last=rows.length?Number(rows[rows.length-1].querySelector('input').value):30;addRuleRow({temperature:Math.min(80,last+3),kind:'cool',level:5})};
 $('rules-form').onsubmit=async e=>{e.preventDefault();const next=[...$('rule-rows').children].map(row=>{const [t,k,l]=row.querySelectorAll('input,select');return{temperature:Number(t.value),kind:k.value,level:k.value==='stop'?0:Number(l.value)}});try{validateRules(next);rules=next;storage.set('reon-glass-rules',rules);closeDialogs();toast('ルールを保存しました');render();if(sensorAuto&&reading)await applySensor(reading)}catch(error){$('rules-error').textContent=error.message}};
 function motionFresh(sample=motionReading){return !!sample&&Date.now()-sample.time>=0&&Date.now()-sample.time<=MOTION_STALE_MS}
-function distanceAction(){const score=distanceSample(distanceReading,distanceReceivedAt);return score===null?null:distanceOutput(score,caps()??demoCaps)}
+function distanceRatioNow(){const score=distanceSample(distanceReading,distanceReceivedAt);return score===null?null:scoreToRatio(score,distanceReading?.fullScale??1)}
+function activeCalibration(){return validCalibration(distanceCalibration)?distanceCalibration:null}
+function distanceAction(){const ratio=distanceRatioNow(),c=activeCalibration();return ratio===null||!c?null:calibratedOutput(ratio,c,caps()??demoCaps)}
 const outputKey=action=>action?`${action.kind}:${action.level}`:null;
 const outputLabel=action=>!action?'—':action.kind==='stop'?'停止':`${action.kind==='warm'?'温熱':'冷却'} ${action.level}`;
 function disableDistance(){distanceAuto=false;distanceEpoch++;distanceJob=null;distanceApplied=null;$('distance-auto').checked=false;}
@@ -146,8 +150,37 @@ function renderDistanceLink(){
   $('distance-auto').checked=distanceAuto;
   $('distance-output').textContent=outputLabel(distanceAction());
   $('distance-link-status').textContent=distanceAuto?'距離に連動中':'連動OFF';
-  const c=caps();$('distance-link-note').textContent=c&&(c.coolLevels<5||c.warmLevels<4)?`本体の上限に調整：冷却${Math.min(5,c.coolLevels)} / 温熱${Math.min(4,c.warmLevels)}`:'';
+  const c=caps();$('distance-link-note').textContent=c&&(c.coolLevels<CALIBRATION.far.level||c.warmLevels<CALIBRATION.near.level)?`本体の上限に調整：冷却${Math.min(CALIBRATION.far.level,c.coolLevels)} / 温熱${Math.min(CALIBRATION.near.level,c.warmLevels)}`:'';
+  renderCalibration();
 }
+function renderCalibration(){
+  const c=activeCalibration(),ratio=distanceRatioNow(),cm=c?estimateCm(ratio,c):null;
+  $('distance-estimate').textContent=!c?'未キャリブレーション':ratio===null?'—':ratio===Infinity?'2人未満 · 160cm以上として扱う':`約 ${Math.max(0,Math.round(cm))} cm`;
+  for(const point of ['near','far']){const value=distanceCalibration[point];$('distance-calib-'+point+'-value').textContent=calibrating?.point===point?'計測中…':Number.isFinite(value)?`記録済み · 対角線の${(value*100).toFixed(1)}%`:'未記録';$('distance-calib-'+point).disabled=!!calibrating;$('distance-calib-'+point).textContent=Number.isFinite(value)?'記録し直す':'記録する';}
+  $('distance-calib-reset').disabled=!!calibrating||(distanceCalibration.near===null&&distanceCalibration.far===null);
+  $('distance-calib-state').textContent=calibrating?'計測中':c?'完了':distanceCalibration.near!==null?'160cmが未記録':distanceCalibration.far!==null?'80cmが未記録':'未設定';
+  $('distance-calibration').classList.toggle('done',!!c);
+}
+function startCalibration(point){
+  if(calibrating)return;
+  if(calibrationSample(distanceReading)===null){$('distance-calib-message').textContent='距離計測をONにし、2人だけを映した状態で記録してください。';return;}
+  calibrating={point,samples:[],received:0};$('distance-calib-message').textContent=`${CALIBRATION[point].cm}cmを計測中です。3秒間そのまま静止してください。`;
+  setTimeout(finishCalibration,CALIBRATION.windowMs);renderCalibration();
+}
+function finishCalibration(){
+  const job=calibrating;calibrating=null;if(!job)return;
+  const cm=CALIBRATION[job.point].cm;
+  if(job.samples.length<CALIBRATION.minSamples||job.samples.length*2<job.received){$('distance-calib-message').textContent=`${cm}cmを記録できませんでした。2人だけを映し、検出が途切れない状態で再試行してください。`;updateDistanceOutput();return;}
+  const value=median(job.samples),other=job.point==='near'?'far':'near',next={...distanceCalibration,[job.point]:value,[job.point+'At']:new Date(Date.now()).toISOString()};
+  let note='';
+  if(next[other]!==null&&!validCalibration({near:next.near,far:next.far})){next[other]=null;next[other+'At']=null;note=` 80cmと160cmの値が近すぎるか逆転しているため、${CALIBRATION[other].cm}cmの記録を消去しました。立ち位置を確認して記録し直してください。`;}
+  distanceCalibration=next;storage.set(CALIBRATION_KEY,next);
+  $('distance-calib-message').textContent=`${cm}cmを記録しました（${job.samples.length}フレームの中央値）。`+note+(validCalibration(next)?' キャリブレーション完了。':'');
+  updateDistanceOutput();
+}
+$('distance-calib-near').onclick=()=>startCalibration('near');
+$('distance-calib-far').onclick=()=>startCalibration('far');
+$('distance-calib-reset').onclick=()=>{if(calibrating)return;distanceCalibration=emptyCalibration();storage.set(CALIBRATION_KEY,distanceCalibration);$('distance-calib-message').textContent='キャリブレーションを消去しました。';updateDistanceOutput();};
 async function pumpDistance(){
   if(distanceSending)return;distanceSending=true;
   try{while(distanceJob){
@@ -163,13 +196,13 @@ async function pumpDistance(){
 }
 function updateDistanceOutput(){
   const action=distanceAction();renderDistanceLink();if(!distanceAuto)return;
-  if(!action){stop('距離計測の停止・更新切れで停止');return;}
+  if(!action){stop(activeCalibration()?'距離計測の停止・更新切れで停止':'キャリブレーション未完了で停止');return;}
   distanceJob={action,key:outputKey(action),epoch:distanceEpoch};void pumpDistance();
 }
-window.addEventListener('reon-distance',({detail})=>{distanceReading=detail;distanceReceivedAt=Date.now();updateDistanceOutput()});
+window.addEventListener('reon-distance',({detail})=>{distanceReading=detail;distanceReceivedAt=Date.now();if(calibrating){calibrating.received++;const sample=calibrationSample(detail);if(sample!==null)calibrating.samples.push(sample);}updateDistanceOutput()});
 $('distance-auto').onchange=()=>{
   if(!$('distance-auto').checked){if(distanceAuto)void stop('距離連動OFFで停止');return;}
-  if(!requireConnection()||!distanceAction()){disableDistance();renderDistanceLink();if(ready())toast('距離計測をONにし、有効な値を受信してください');return;}
+  if(!requireConnection()||!distanceAction()){disableDistance();renderDistanceLink();if(ready())toast(activeCalibration()?'距離計測をONにし、有効な値を受信してください':'先に80cm・160cmのキャリブレーションを完了してください');return;}
   sensorAuto=false;disableMotion();distanceEpoch++;distanceAuto=true;distanceApplied=null;render();updateDistanceOutput();
 };
 setInterval(updateDistanceOutput,250);
