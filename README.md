@@ -4,9 +4,9 @@ REON Pocket Pro Plus向けのWeb Bluetoothコントローラ。冷却・温熱�
 
 ## 起動
 
-Node.js 24以降で `node scripts/build.mjs`、`node server.js` を実行し、http://localhost:4173 を開きます。本体のSMARTボタンを約2秒押し、デバイスを接続します。本体を選ぶ操作はブラウザの要件です。冷却または温熱のレベルを押すと、未接続なら接続してその出力で開始し、接続済みならそのまま切り替えます。
+公開URLは https://reon.tomisuke.com/ です。ローカルではNode.js 22以降で `node server.js` を実行し、http://localhost:4173 を開きます。本体のSMARTボタンを約2秒押し、デバイスを接続します。本体を選ぶ操作はブラウザの要件です。冷却または温熱のレベルを押すと、未接続なら接続してその出力で開始し、接続済みならそのまま切り替えます。
 
-配信はWorker ESMとR2です。`node scripts/build.mjs` でビルドし、Sitesのソース同期・パッケージ・配信ワークフローで公開します。SitesのIDは `.openai/hosting.json` に保存しています。
+配信はGitHub Pagesです。`main` へpushすると、GitHub Actionsがテストとファームウェアのビルドを実行し、成功した場合だけ `dist/` をそのまま公開します（ビルド工程はありません）。手順は `CLOUD-EDIT.md` を参照してください。
 
 ## 操作
 
@@ -76,7 +76,7 @@ Chromeで本体が選択できた後の `NotSupportedError` は、ブラウザ�
 
 ## 対応ブラウザ
 
-Chrome / Edgeのデスクトップ、Android ChromeなどWeb Bluetooth対応環境が必要です。iPhone / iPadではBluefyなど対応ブラウザが必要です。Safari / Firefoxは本体との接続に対応しません。Sites内の埋め込み表示でBluetoothが利用できない場合はURLを対応ブラウザで直接開いてください。
+Chrome / Edgeのデスクトップ、Android ChromeなどWeb Bluetooth対応環境が必要です。iPhone / iPadではBluefyなど対応ブラウザが必要です。Safari / Firefoxは本体との接続に対応しません。他サイトへの埋め込み表示でBluetoothが利用できない場合はURLを対応ブラウザで直接開いてください。
 
 ## 出典とライセンス
 
@@ -88,9 +88,9 @@ Chrome / Edgeのデスクトップ、Android ChromeなどWeb Bluetooth対応環�
 
 「人物間の距離」カードのスイッチでON/OFFできます。ONでREON画面内にカメラ・動画の計測を表示し、OFFでカメラと解析を停止して100へ戻します。プレビューは画面内拡大・全画面表示に対応。検出途切れ補正は標準ON・1秒で、0.5〜3秒の変更またはOFFが可能です。明示的な停止・切断では補正を使わず100に戻します。
 
-映像から0〜100の距離スコアを算出するサービスを追加。入口は /distance。REON画面の「人物間の距離」カードで参照・画面内解析、別端末では共有JSON APIを利用できます。技術選定の全理由、距離の定義、API契約、利用条件は DISTANCE.md に記載しています。
+映像から0〜100の距離スコアを算出します。単独ページは distance.html。REON画面の「人物間の距離」カードで画面内解析できます。技術選定の理由、距離の定義、利用条件は DISTANCE.md に記載しています。
 
-配信は静的ホスティングからWorker ESMとR2へ移行しました。ローカル起動前に node scripts/build.mjs を実行してください。既存のBluetoothモジュールは維持しています。
+以前のSites版（Worker＋R2）にあった「別端末の共有API」は、GitHub Pagesへの移行で廃止しました。計測と連動は同じ画面内で行います。
 
 
-距離計測と本体接続後、2人の間隔を80cm・160cmにしてそれぞれキャリブレーションを記録し、「REON連動」をONにすると80cmで温熱2、112cm前後で停止、160cmで冷却3。間は線形に段階が変わり、範囲外は端の出力を維持します。キャリブレーション未完了では連動できません。計測中の0〜1人は160cm以上として冷却3、計測停止・更新切れ・連動OFF・キャリブレーションのリセットでは運転停止と連動解除。手動操作と他のセンサー連動が優先し、本体側の停止後は自動再始動しません。詳細は DISTANCE.md を参照してください。ブラウザの共有距離API→模擬BLE検証は scripts/qa-distance-output.cjs。
+距離計測と本体接続後、2人の間隔を80cm・160cmにしてそれぞれキャリブレーションを記録し、「REON連動」をONにすると80cmで温熱2、112cm前後で停止、160cmで冷却3。間は線形に段階が変わり、範囲外は端の出力を維持します。キャリブレーション未完了では連動できません。計測中の0〜1人は160cm以上として冷却3、計測停止・更新切れ・連動OFF・キャリブレーションのリセットでは運転停止と連動解除。手動操作と他のセンサー連動が優先し、本体側の停止後は自動再始動しません。詳細は DISTANCE.md を参照してください。キャリブレーション→模擬BLEのブラウザ検証は scripts/qa-distance-output.cjs。

@@ -4,8 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "bun test",
-    "start": "node server.js",
-    "build": "node scripts/build.mjs"
+    "start": "node server.js"
   },
   "devDependencies": {
     "happy-dom": "*"

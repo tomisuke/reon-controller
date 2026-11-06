@@ -4,10 +4,8 @@ export function mountDistance(root=document,{onReading=()=>{}}={}){
 const $=id=>root.querySelector('#'+id), video=$('video'), canvas=$('overlay'), ctx=canvas.getContext('2d');
 const hold=new DetectionHold();
 const channel=typeof BroadcastChannel==='function'?new BroadcastChannel('reon-distance'):null;
-let detector,modelPromise,stream,objectUrl,active=false,generation=0,timer,latest=null,lastLocal=0,lastPublish=0,session=null,queue=Promise.resolve();
-let sharing=false,loopGeneration=0,pendingPublish=0;
+let detector,modelPromise,stream,objectUrl,active=false,generation=0,timer,latest=null,lastLocal=0,loopGeneration=0;
 try{const saved=JSON.parse(localStorage.getItem('reon-distance-hold-v1'));if(saved&&[0,500,1000,1500,2000,3000].includes(saved.holdMs)){hold.holdMs=saved.holdMs;$('hold-enabled').checked=saved.holdMs>0;$('hold-duration').value=String(saved.holdMs||1000);}}catch{}
-try{session=JSON.parse(localStorage.getItem('reon-distance-session-v1'));if(session&&Date.parse(session.expiresAt)<Date.now())session=null;}catch{}
 function message(text){$('message').textContent=text;}
 function script(src){return new Promise((resolve,reject)=>{const el=document.createElement('script');el.src=src;el.onload=resolve;el.onerror=()=>{el.remove();reject(Error('AIライブラリを取得できません。ネット接続を確認して再試行してください。'));};document.head.append(el);});}
 async function model(){
@@ -29,7 +27,6 @@ function inactive(){
   try{localStorage.setItem(LOCAL_KEY,JSON.stringify(data));}catch{}
   channel?.postMessage(data);display(null);latest=null;ctx.clearRect(0,0,canvas.width,canvas.height);
   onReading(data);
-  publish({active:false},true);
 }
 function display(result){
   const score=result?.score??100;
@@ -44,20 +41,6 @@ function stopInput(reason='計測を停止しました。出力は100です。')
   if(objectUrl){URL.revokeObjectURL(objectUrl);objectUrl=null;}
   video.hidden=true;$('empty').hidden=false;$('stop').disabled=true;$('camera').disabled=false;$('file').disabled=false;
   $('active-dot').classList.remove('live');$('runtime').textContent='待機中';$('fps').textContent='—';inactive();message(reason);
-}
-function publish(payload,force=false){
-  if(!session)return;
-  if(!force&&pendingPublish>0)return;
-  const now=Date.now();if(!force&&now-lastPublish<1000)return;lastPublish=now;
-  const target={...session}, epoch=generation;pendingPublish++;
-  queue=queue.catch(()=>{}).then(async()=>{
-    if(!force&&epoch!==generation)return;
-    try{
-      const r=await fetch('/api/distance/'+target.id,{method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+target.writeToken},body:JSON.stringify(payload),signal:AbortSignal.timeout(5000)});
-      if(!r.ok)throw Error('HTTP '+r.status);
-      $('share-message').textContent=payload.active?'共有中 · 数値のみ毎秒更新。停止・5秒更新切れで100。':'共有中 · 計測停止のため100。';
-    }catch(error){$('share-message').textContent='共有APIの更新失敗: '+error.message+'。更新から5秒後にAPIの値は100になります。';}
-  }).finally(()=>pendingPublish--);
 }
 function draw(result,people){
   canvas.width=video.videoWidth;canvas.height=video.videoHeight;ctx.clearRect(0,0,canvas.width,canvas.height);
@@ -83,7 +66,6 @@ async function beginLoop(epoch){
       const data={...result,centers:undefined,active:true,receivedAt:Date.now(),holdUntil:result.holding?Date.now()+result.holdRemainingMs:null};
       onReading(data);
       if(Date.now()-lastLocal>=200){try{localStorage.setItem(LOCAL_KEY,JSON.stringify(data));}catch{}channel?.postMessage(data);lastLocal=Date.now();}
-      publish({active:true,score:result.score,personCount:result.personCount,fullScale:result.fullScale,holding:result.holding,holdRemainingMs:result.holdRemainingMs,holdEpoch:result.holdEpoch});
       message(result.holding?'人物の検出が一時的に途切れています。直前のスコアを短時間保持しています。':'計測中。映像は端末内で処理しています。画面を開いたまま使用してください。');
       timer=setTimeout(tick,Math.max(0,200-elapsed));
     }catch(error){if(epoch===generation&&cycle===loopGeneration)stopInput('解析に失敗しました: '+error.message);}
@@ -125,31 +107,10 @@ $('scale').oninput=()=>{$('scale-label').textContent='映像の対角線の'+$('
 $('hold-enabled').onchange=$('hold-duration').onchange=()=>{hold.holdMs=$('hold-enabled').checked?Number($('hold-duration').value):0;hold.reset();$('hold-duration').disabled=!$('hold-enabled').checked;try{localStorage.setItem('reon-distance-hold-v1',JSON.stringify({holdMs:hold.holdMs}));}catch{}};
 $('hold-duration').disabled=!$('hold-enabled').checked;
 $('calibrate').onclick=()=>{if(!latest?.pair)return;$('scale').value=Math.max(5,Math.min(100,Math.round(latest.distanceRatio*100)));$('scale').oninput();message('現在の距離を最大距離に設定しました。次の解析から反映します。');};
-function showSession(){
-  $('share-result').hidden=!session;$('share').hidden=!!session;
-  if(session){$('read-url').value=location.origin+'/api/distance/'+session.id;$('controller-link').href='/?distance='+encodeURIComponent($('read-url').value);}
-}
-$('share').onclick=async()=>{
-  if(sharing)return;sharing=true;$('share').disabled=true;
-  try{
-    const response=await fetch('/api/distance/sessions',{method:'POST',signal:AbortSignal.timeout(8000)});
-    if(response.status===401){$('signin').hidden=false;throw Error('共有APIの作成にはログインが必要です。端末内の計測はそのまま利用できます。');}
-    if(!response.ok)throw Error('HTTP '+response.status);
-    session=await response.json();try{localStorage.setItem('reon-distance-session-v1',JSON.stringify(session));}catch{}
-    showSession();lastPublish=0;$('share-message').textContent='共有APIを作成しました。計測中は毎秒更新します。';if(!active)publish({active:false},true);
-  }catch(error){$('share-message').textContent=error.message;}finally{sharing=false;$('share').disabled=false;}
-};
-$('copy').onclick=async()=>{try{await navigator.clipboard.writeText($('read-url').value);$('share-message').textContent='読み取り専用URLをコピーしました。';}catch{$('read-url').select();$('share-message').textContent='URLを選択しました。コピーしてください。';}};
-$('revoke').onclick=async()=>{
-  if(!session)return;const target=session;$('revoke').disabled=true;await queue.catch(()=>{});
-  try{const r=await fetch('/api/distance/'+target.id,{method:'DELETE',headers:{Authorization:'Bearer '+target.writeToken},signal:AbortSignal.timeout(5000)});if(!r.ok)throw Error('HTTP '+r.status);session=null;try{localStorage.removeItem('reon-distance-session-v1');}catch{}showSession();$('share-message').textContent='共有を削除しました。以前のAPIは無効です。';}
-  catch(error){$('share-message').textContent='削除できませんでした: '+error.message;}finally{$('revoke').disabled=false;}
-};
 const onVisibility=()=>{if(document.hidden)stopInput('画面が非表示になったため停止しました。再開には映像を選び直してください。');};
 document.addEventListener('visibilitychange',onVisibility);
-const onPageHide=()=>{generation++;active=false;stream?.getTracks().forEach(t=>t.stop());try{localStorage.setItem(LOCAL_KEY,JSON.stringify({active:false,receivedAt:Date.now()}));}catch{}channel?.postMessage({active:false,receivedAt:Date.now()});if(session)fetch('/api/distance/'+session.id,{method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+session.writeToken},body:JSON.stringify({active:false}),keepalive:true}).catch(()=>{});};
+const onPageHide=()=>{generation++;active=false;stream?.getTracks().forEach(t=>t.stop());try{localStorage.setItem(LOCAL_KEY,JSON.stringify({active:false,receivedAt:Date.now()}));}catch{}channel?.postMessage({active:false,receivedAt:Date.now()})};
 window.addEventListener('pagehide',onPageHide);
-showSession();
 return {stop:()=>stopInput(),destroy(){stopInput();document.removeEventListener('visibilitychange',onVisibility);window.removeEventListener('pagehide',onPageHide);channel?.close();detector?.dispose();}};
 }
 if(document.querySelector('body > .topbar'))mountDistance();

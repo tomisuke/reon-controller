@@ -1,6 +1,6 @@
 # 人物間距離サービス
 
-公開後の入口: `https://reon-pocket-glass.tomisuke.chatgpt.site/distance`。REON Controllerの「人物間の距離」カードから同じページ内でも使用可能。
+公開後の入口: `https://reon.tomisuke.com/distance.html`（GitHub Pages）。REON Controllerの「人物間の距離」カードから同じページ内でも使用可能。
 
 ## スコアの仕様
 
@@ -11,7 +11,6 @@
 - 撮影範囲で最も遠い配置を100にしたい場合、その配置で「現在の2人の距離を100に設定」を押す。最大距離は対角線の5〜100%に設定可能。
 - 0人・1人は100。ただし検出途切れ補正ONでは、直前に2人以上を検出していた場合、標準1秒間だけ前回スコアを保持する（0.5〜3秒に変更・OFF可能）。初めから0〜1人のときは保持しない。人数は実際の検出人数を表示し、保持中は `holding` を表示する。3人以上では最も近い組を採用。人物IDの継続追跡や特定人物の選択は行わない。最大30検出枠、初期信頼度55%。
 - 停止、一時停止、シーク中、終了、カメラ切断、解析失敗、非表示で出力を100に戻す。非表示から戻ったときは手動で再開する。
-- 共有APIとControllerは5秒更新切れで100。APIの更新時刻はサーバー時刻。`fresh` と `status` で「遠い」と「計測なし」を区別できる。
 - これは映像上の2Dの相対距離であり、メートルや3D距離ではない。カメラの角度・遠近・レンズ・遮蔽に依存する。実距離にはカメラ校正、床面の射影変換、または深度センサーが別途必要。
 
 ## 技術選定と理由
@@ -24,14 +23,11 @@
 | HTML / CSS / ES Modules | 既存REONがこの構成なので、そのまま拡張できる。React等の追加フレームワークやランタイム依存を増やす必要がない。画面、計算、連携、APIをモジュールで分離。 |
 | getUserMedia / HTMLVideoElement / Canvas | ブラウザ標準APIでカメラ・動画ファイルと検出枠描画を実現。音声は取得しない。HTTPSとカメラ権限が必要。動画コーデック対応はブラウザ次第。 |
 | 2Dの中心間距離と固定スケール | 単眼映像だけで誤ってメートルを推定せず、式を説明・再現できる。検出枠の端の間隔は重なったとき広い範囲が0になるため中心を選ぶ。履歴最大値での自動正規化は値が不安定になるため使わない。検出漏れだけを短時間保持し、実測距離には平均化をかけない。 |
-| 解析は最大5fps、APIは最大1Hz | 人の位置変化と端末負荷のバランスを取るための初期設定。推論を重複させない。実fpsは端末の性能に依存し、最低速度を保証するものではない。APIへ送るのはscore・人数・スケール・activeと保持状態の数値情報のみ。 |
-| 同一オリジンのWorker API | REONの既存ドメインに `/distance` と `/api/distance/…` を追加し、クロスオリジンのCookie/CORS問題を避ける。WebSocket専用サーバーを作らず通常のJSON取得で利用可能。既存の直列Bluetooth送信を再利用し、距離の対応出力を送信する。 |
-| Cloudflare Workers ESM | Sitesでサポートされるサーバー実行形式。静的サイトを既存URL・公開範囲・ファイルを維持して移行する。小規模APIなので、Nodeサーバーの常駐運用やVinextのUI再構築は不要。ビルドはNode標準ライブラリだけで既存アセットを埋め込む。 |
-| R2の最新値保存 | 最新の数値1件と共有認証情報だけが必要で、SQLの関係・履歴検索は不要なためD1を導入しない。Workerメモリだけに依存せず、別端末・別インスタンスから同じ数値を取得する。履歴・画像・座標は保存しない。論理期限は7日で、期限後は410。失効オブジェクトの自動物理削除は未実装。 |
-| 読み取り用128bitランダムID、書き込み用256bitトークン | 読み取りURLだけをControllerへ渡せる。作成はSitesのログイン済みユーザーに限定、更新・削除には別のトークンと同一Originが必要。サーバーにはトークンのSHA-256だけを保存。URLを知る人は数値を読めるため、公開投稿はしない。書き込みトークンは計測端末のブラウザストレージだけに保持し、ソースや画面には出さない。 |
-| localStorage / BroadcastChannel | 同じブラウザ・同じオリジンでは共有API作成やログインなしで参照できる。永続サーバーデータの代用にはしない。別端末にはR2付きAPIを使う。計測画面は1つずつ使う。 |
+| 解析は最大5fps | 人の位置変化と端末負荷のバランスを取るための初期設定。推論を重複させない。実fpsは端末の性能に依存し、最低速度を保証するものではない。 |
+| GitHub Pagesの静的配信 | HTML・CSS・JavaScriptだけで動くため、サーバー実行環境が不要。HTTPSでWeb Bluetoothとカメラの要件を満たす。GitHub Actionsでテストとファームウェアのビルドに通った版だけを公開する。以前のSites版（Worker＋R2）にあった別端末への共有APIは廃止した。 |
+| localStorage / BroadcastChannel | 同じブラウザ・同じオリジンでは、サーバーなしでスコアを参照できる。計測画面は1つずつ使う。 |
 | 最大5秒の鮮度期限、タイムアウト、直列更新 | 古い近距離値を使い続けない。通信やストレージ障害時は100に倒し、エラーを表示する。物理機器への出力は自動で開始せず、数値の参照機能を提供する。 |
-| 固定バージョンのCDN | MLランタイムをSitesのWorkerに大きく埋め込まず配信できる。バージョンを固定して意図しない更新を避ける。CDNとモデル配布元に依存するため、外部配信停止時やオフライン初回利用ではモデルを読み込めない。Google Fontsは表示用で、取得できない場合はOSフォントへ戻る。 |
+| 固定バージョンのCDN | MLランタイムを配信物に大きく含めずに済む。バージョンを固定して意図しない更新を避ける。CDNとモデル配布元に依存するため、外部配信停止時やオフライン初回利用ではモデルを読み込めない。Google Fontsは表示用で、取得できない場合はOSフォントへ戻る。 |
 
 公式資料: [COCO-SSD](https://github.com/tensorflow/tfjs-models/blob/master/coco-ssd/README.md)、[TensorFlow.js](https://www.tensorflow.org/js)、[getUserMedia](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)。
 
@@ -40,8 +36,6 @@
 1. REONの「人物間の距離」のスイッチをONにすると、その画面内でカメラ計測を開始する。動画も選択できる。OFFでカメラトラック・解析・取得を停止し、100へ戻す。ONはページを再読込すると引き継がない。カメラ許可が必要。
 2. 「プレビューを拡大」で同じ映像を大きく表示、「全画面」でブラウザの全画面表示。映像を作り直さず計測を継続する。拡大はボタンまたはEscapeで戻せる。Fullscreen非対応・拒否時は画面内拡大を使う。
 3. 「検出途切れ補正」は標準ON・1秒。保持時間を変更するかOFFにできる。この設定は端末内に保存。明示的な停止・切断・一時停止・動画終了では保持せず100。
-4. 別端末の場合、計測画面の「別端末にスコアを共有」から「共有APIを作成」。必要ならChatGPTでログインし、戻って作成する。
-5. 受け側REONで入力を「別端末の共有API」にし、読み取り専用URLを貼ってON。または「この値をControllerで開く」。OFFで取得を停止する。
 
 本体を接続し、距離計測をONにして有効な値が表示されたら「REON連動」をONにする。計測と実機連動は別スイッチ。連動は初期OFFで、再読込後に自動では開始しない。既存の温度API欄は摂氏温度用なので距離APIは入れない。
 
@@ -62,7 +56,7 @@ REON連動には2点キャリブレーションが必須。2人だけを映し�
 - 推定距離（cm）は2点からの線形近似。カメラの遠近や斜め配置では誤差が大きく、実測値ではない。
 
 - 計測中の0〜1人は仕様どおり100で、160cm以上として扱い連動中は冷却3になる。検出途切れ補正中は直前のスコアに対応する出力を維持し、補正期限後は100へ移る。
-- 計測OFF、動画停止、カメラ切断、API取得失敗、更新が5秒超途絶えた場合は運転停止と連動解除。新しい値が戻っても自動再開しない。
+- 計測OFF、動画停止、カメラ切断、更新が5秒超途絶えた場合は運転停止と連動解除。新しい値が戻っても自動再開しない。
 - REON連動OFFでも運転停止。手動レベル選択・開始・停止は距離連動を解除。距離・加速度・周囲温度の自動連動は同時には有効にしない。
 - 本体から停止が報告された場合は距離連動を解除し、次の計測で再始動しない。本体の停止を上書きする定期的な再送はしない。
 - 同じ出力は再送せず、送信中の更新は最新の出力1件にまとめる。古い送信待ちは連動世代・鮮度・現在の対応出力を確認して破棄する。
@@ -72,47 +66,18 @@ REON連動には2点キャリブレーションが必須。2人だけを映し�
 同じブラウザでプログラムから参照:
 
 ```js
-import {localDistance, fetchDistance} from '/distance-client.js';
+import {localDistance} from './distance-client.js';
 const local = localDistance(); // {score, personCount, fresh, ...}
-const remote = await fetchDistance('/api/distance/<共有ID>');
 window.addEventListener('reon-distance', ({detail}) => console.log(detail.score));
 // Controllerの参照中は window.reonDistance にも最新の読取値を公開。
 ```
 
-別端末のAPI（同じオリジンからのfetch、またはサーバーからのHTTP GET）:
-
-```json
-{
-  "schemaVersion": 1,
-  "score": 24.3,
-  "personCount": 2,
-  "status": "tracking",
-  "fresh": true,
-  "timestamp": "2026-10-21T00:00:00.000Z",
-  "ageMs": 100,
-  "staleAfterMs": 5000,
-  "metric": "nearest_centers_2d",
-  "fullScale": 1
-}
-```
-
-- `POST /api/distance/sessions` : Sitesログインと同一Originが必要。`id / writeToken / readUrl / expiresAt` を返す。
-- `PUT /api/distance/:id` : `Authorization: Bearer <writeToken>` とJSON `{active:true,score:24.3,personCount:2,fullScale:1}`。補正保持中は `holding:true,holdRemainingMs:残りミリ秒`（1〜3000）を追加し、personCountには現在の実際の検出人数を渡す。停止は `{active:false}`。scoreは端末内推論による値で、サーバーは範囲・人数・保持上限を検証し、連続した保持更新で期限を延長しない。
-- `GET /api/distance/:id` : 読み取りURLによる最新値取得。書き込みトークンは不要。`Cache-Control: no-store`。状態が停止/期限切れなら100。
-- `DELETE /api/distance/:id` : トークンと同一Originが必要。共有URLを失効。
-- 不明ID404、期限切れ410、認証401、Origin違反403、入力不正400、ストレージ障害503。取得失敗時も呼び出し側は100を使う。
-- 他のWebサイトのブラウザからのCORSアクセスは許可しない。同じREONサイトまたはサーバーから参照する。
-- 応答の `holding` と `holdRemainingMs` で保持状態を参照できる。`status:holding` では人物が2人未満でも短時間だけ前回スコアを出力する。APIの保持期限が過ぎると、5秒の鮮度期限を待たず100へ戻す。
-- 送信の `holdEpoch` は直近の検出成功を示す端末内の単調時刻。再検出を挟んだ別の検出漏れを区別し、API更新の間に短い再検出があった場合も新しい保持期間を扱える。映像や位置は含まない。
-
 ## 統合の構成
 
-REON内の計測はiframeを使わず、`mountDistance(root, {onReading})` で同じDOMに組み込む。独立の `/distance` と同じ解析・補正ロジックを利用する。専用のCSSは `.distance-widget` の範囲に適用し、REONの既存画面へ影響を広げない。OFF中は解析画面もモデルも読み込まず、ONで初期化する。数値はコールバックで即時反映し、タイマーでも鮮度と保持期限を確認する。
+REON内の計測はiframeを使わず、`mountDistance(root, {onReading})` で同じDOMに組み込む。独立の `distance.html` と同じ解析・補正ロジックを利用する。専用のCSSは `.distance-widget` の範囲に適用し、REONの既存画面へ影響を広げない。OFF中は解析画面もモデルも読み込まず、ONで初期化する。数値はコールバックで即時反映し、タイマーでも鮮度と保持期限を確認する。
 
 ## ローカル起動・検証
 
-`node scripts/build.mjs` → `node server.js` → `http://127.0.0.1:4173/distance`。
+`node server.js` → `http://127.0.0.1:4173/distance.html`（静的ファイルをそのまま配信）。
 
-ローカルプレビューのみメモリストレージと開発用IDを使用する。再起動すると共有は消える。本番WorkerはSitesから渡された認証情報とR2を使う。
-
-計算・API: `node --test tests/distance.node.test.js`。既存REON回帰: `bun test`。ブラウザ確認スクリプトは `scripts/qa-distance.cjs`（PlaywrightとChromeが必要）。実際のカメラ、REON実機、撮影現場の検出精度は別途確認が必要。
+計算: `bun test tests/distance.node.test.js tests/distance-output.test.js`。全体: `bun test`。ブラウザ確認スクリプトは `scripts/qa-distance.cjs`（実推論、Playwright＋Chrome、CDNへの接続が必要）と `scripts/qa-distance-output.cjs`（キャリブレーションとREON連動、模擬BLE）。

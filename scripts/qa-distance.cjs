@@ -3,7 +3,7 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
 (async()=>{
  const output=process.env.QA_DIR||path.resolve('.sites-runtime/qa');fs.mkdirSync(output,{recursive:true});
  const fixtureResponse=await fetch('https://raw.githubusercontent.com/ultralytics/assets/main/im/bus.jpg');if(!fixtureResponse.ok)throw Error('Fixture fetch failed');const fixture=Buffer.from(await fixtureResponse.arrayBuffer());
- const browser=await chromium.launch({channel:'chrome',headless:true,args:['--enable-webgl','--use-angle=swiftshader','--enable-unsafe-swiftshader']});
+ const browser=await chromium.launch({channel:process.env.QA_CHANNEL??'chrome',headless:true,args:['--enable-webgl','--use-angle=swiftshader','--enable-unsafe-swiftshader']});
  try{
   const context=await browser.newContext({viewport:{width:1440,height:1100},reducedMotion:'reduce'});
   await context.route('**/qa-fixture.jpg',route=>route.fulfill({contentType:'image/jpeg',body:fixture}));
@@ -17,8 +17,7 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
    };
   });
   const page=await context.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));
-  const updates=[];page.on('request',r=>{if(r.method()==='PUT'&&r.url().includes('/api/distance/'))updates.push(JSON.parse(r.postData()));});
-  await page.goto('http://127.0.0.1:4173/distance',{waitUntil:'networkidle'});
+  await page.goto((process.env.QA_URL||'http://127.0.0.1:4173/')+'distance.html',{waitUntil:'networkidle'});
   await page.screenshot({path:path.join(output,'distance-desktop.png'),fullPage:true});
   await page.setViewportSize({width:390,height:844});await page.screenshot({path:path.join(output,'distance-mobile.png'),fullPage:true});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
@@ -27,10 +26,6 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
   await page.waitForFunction(()=>Number(document.getElementById('count').textContent)>=2,{},{timeout:90000});
   const measured=await page.evaluate(()=>({score:Number(document.getElementById('score').textContent),people:Number(document.getElementById('count').textContent),backend:tf.getBackend()}));
   assert.ok(measured.score>=0&&measured.score<100);console.log('Real COCO-SSD inference:',JSON.stringify(measured));
-  await page.click('#share');await page.waitForSelector('#share-result:not([hidden])');
-  const readUrl=await page.inputValue('#read-url');await page.waitForFunction(()=>document.getElementById('share-message').textContent.includes('毎秒更新')||document.getElementById('share-message').textContent.includes('数値のみ'));
-  await page.waitForFunction(async()=>{const url=document.getElementById('read-url').value;const r=await fetch(url);const d=await r.json();return d.fresh&&d.personCount>=2;});
-  assert.ok(updates.some(d=>d.active&&d.personCount>=2));assert.ok(updates.every(d=>Object.keys(d).every(k=>['active','score','personCount','fullScale','holding','holdRemainingMs','holdEpoch'].includes(k))));
   await page.screenshot({path:path.join(output,'distance-detection.png'),fullPage:true});
   // Record the real fixture stream, then exercise the actual video-file input path.
   const recording=await page.evaluate(async()=>{const recorder=new MediaRecorder(window.qaStream,{mimeType:'video/webm'}),chunks=[];recorder.ondataavailable=e=>chunks.push(e.data);const done=new Promise(resolve=>recorder.onstop=async()=>resolve([...new Uint8Array(await new Blob(chunks).arrayBuffer())]));recorder.start();await new Promise(r=>setTimeout(r,4000));recorder.stop();return done;});
@@ -41,8 +36,7 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
   await page.locator('#video').evaluate(v=>v.play());await page.waitForFunction(()=>Number(document.getElementById('count').textContent)>=2);
   await page.waitForFunction(()=>document.getElementById('video').ended,{},{timeout:15000});assert.equal(await page.textContent('#score'),'100');
   await page.click('#stop');
-  const stopped=await (await page.request.get(readUrl)).json();assert.equal(stopped.score,100);
-  await page.goto('http://127.0.0.1:4173/');assert.equal(await page.locator('#distance-enabled').isChecked(),false);assert.equal(await page.locator('iframe').count(),0);
+    await page.goto(process.env.QA_URL||'http://127.0.0.1:4173/');assert.equal(await page.locator('#distance-enabled').isChecked(),false);assert.equal(await page.locator('iframe').count(),0);
   await page.check('#distance-enabled');
   await page.waitForFunction(()=>Number(document.getElementById('reon-distance-value').textContent)<100,{},{timeout:90000});
   console.log('REON native integration score:',await page.textContent('#reon-distance-value'));
@@ -65,6 +59,6 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.screenshot({path:path.join(output,'reon-distance-mobile.png'),fullPage:true});
   await page.click('#distance-expand');assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.screenshot({path:path.join(output,'reon-distance-mobile-expanded.png')});await page.uncheck('#distance-enabled');
   assert.equal(errors.length,0,errors.join('\n'));
-  console.log('Passed: real inference/video/API, native REON ON/OFF, camera release, enlargement/fullscreen, short dropout hold/recovery/expiry/disabled protection, desktop/mobile layout; no page errors.');
+  console.log('Passed: real inference/video, native REON ON/OFF, camera release, enlargement/fullscreen, short dropout hold/recovery/expiry/disabled protection, desktop/mobile layout; no page errors.');
  }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

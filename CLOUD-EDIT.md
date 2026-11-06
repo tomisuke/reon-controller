@@ -3,7 +3,7 @@
 - ソース: https://github.com/tomisuke/reon-controller
 - ブラウザエディタ: https://github.dev/tomisuke/reon-controller
 - 自動テスト・デプロイ: https://github.com/tomisuke/reon-controller/actions/workflows/deploy.yml
-- GitHub Pages: https://tomisuke.github.io/reon-controller/
+- 公開URL: https://reon.tomisuke.com/ （GitHub Pages。https://tomisuke.github.io/reon-controller/ も同じ配信物）
 
 ## 編集して公開
 
@@ -32,7 +32,7 @@ GitHubはソース、変更履歴、Webエディタをまとめて管理でき�
 
 このリポジトリは公開です。接続時の認証キーや設定はブラウザで生成・保存され、リポジトリへ送信しません。個人のキー、API認証情報、センサーの実測ログなどはコミットしないでください。
 
-従来のSites版 `reon.tomisuke.com` は別の配信先です。GitHub側の自動公開先は上記GitHub Pages URLで、Sites版へ自動同期する構成ではありません。独自ドメインをPagesへ移す場合は、GitHub PagesのCustom domain設定とDNSの変更が必要です。
+`reon.tomisuke.com` はこのリポジトリのGitHub Pagesで配信します。リポジトリの Settings → Pages → Custom domain に `reon.tomisuke.com` を設定し、DNSで `reon` のCNAMEを `tomisuke.github.io` に向けます。DNS反映後に「Enforce HTTPS」をオンにします。以前のOpenAI Sites版（Worker＋R2）は使用しません。
 
 ドメインが変わると、ブラウザのBluetooth接続許可と保存設定は引き継がれません。新しいURLで機器を選び直してください。
 
