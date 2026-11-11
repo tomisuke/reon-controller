@@ -24,6 +24,7 @@ node server.js
 - `dist/reon-client.js`, `dist/protocol.js`, `dist/gatt.js`: REONのBluetooth通信。本体のAUTO START/STOPを無効化してから手動出力を送る。ここを変更すると短時間で運転が停止する問題が再発し得る。
 - `dist/distance-core.js`, `dist/distance-app.js`, `dist/distance-panel.js`: カメラ/動画による人物間距離の検出。
 - `dist/distance-output.js`: 距離スコアからREONの段階出力へ変換する純粋関数。
+- `dist/reon-fleet.js`: 2台制御の共通処理（本体ごとの送信フレーム、出力表示、共通レベル範囲）。`app.js` は本体A/Bの `ReonClient` を2つ持つ。
 - `dist/motion.js`, `dist/m5-client.js`: M5StickS3の加速度連動。
 - `dist/` はそのまま公開される。ビルド工程はない。パスはサブパス配信でも動くよう相対パスで書く（`/` 始まりにしない）。
 - `.github/workflows/deploy.yml`: `main` へのpushでテスト・ファームウェアビルド・GitHub Pages公開。
@@ -51,6 +52,14 @@ REON連動の前に80cm・160cmの2点キャリブレーションが必須（`di
 - キャリブレーション未完了・リセット・矛盾した記録では連動を開始せず、連動中なら停止して解除する。
 - 本体が温熱2・冷却3をサポートしない場合、能力情報から上限を調整して表示する。
 
+## 2台制御の仕様
+
+- 本体A/Bを別々に接続する。同じ本体を両方の枠に選ぶことは拒否する（`DuplicateDeviceError`）。
+- 手動操作は、2台とも接続中のときだけ「操作対象 A / B / 両方」に従う。1台だけ接続中のときは接続中の本体を操作する。
+- 連動は接続中の全台に同じ出力を送る（レベルは本体ごとの上限で調整）。途中で接続した本体も連動に加わる。
+- 連動中に切断・書き込み失敗・本体の自発停止が起きた本体は連動から外し、残りの本体で継続する。連動対象が0台になったら解除する。
+- 手動出力・手動停止は対象に関係なく全体の連動を解除する。
+
 ## 変更時の確認
 
 最低限、以下を実行する。
@@ -59,7 +68,7 @@ REON連動の前に80cm・160cmの2点キャリブレーションが必須（`di
 bun test
 ```
 
-距離出力の変更時は `tests/distance-output.test.js` と `tests/app.test.js` を更新する。ブラウザ検証環境がある場合は、ローカルサーバー起動後に以下も実行する。
+距離出力の変更時は `tests/distance-output.test.js` と `tests/app.test.js` を、2台制御の変更時は `tests/multi-device.test.js` を更新する。ブラウザ検証環境がある場合は、ローカルサーバー起動後に以下も実行する。
 
 ```sh
 node scripts/qa-distance-output.cjs

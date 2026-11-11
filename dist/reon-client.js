@@ -70,8 +70,15 @@ function receiveTagAdvertisement(device) {
   });
 }
 
+export function sameBluetoothDevice(a, b) {
+  return !!a && !!b && (a === b || (!!a.id && a.id === b.id));
+}
+
 export class ReonClient {
   #device;
+  #slot;
+  #tagStorage;
+  #isTaken;
   #characteristics = {};
   #listeners = new Set();
   #writeQueue = Promise.resolve();
@@ -108,7 +115,7 @@ export class ReonClient {
     tag: null,
     autoStart: null,
     quickLaunch: null,
-    tagLinked: Boolean(localStorage.getItem(TAG_ADDRESS_STORAGE)),
+    tagLinked: false,
     pairingTag: false,
     error: null,
     connectionDetail: null,
@@ -116,6 +123,18 @@ export class ReonClient {
     manualControl: null,
     lastStop: null,
   };
+
+  // slot: identifies this unit when several REON devices are controlled at once.
+  // isTaken(device): true when another controller already uses the selected device.
+  constructor({ slot = 'a', isTaken = null } = {}) {
+    this.#slot = slot;
+    this.#isTaken = isTaken;
+    this.#tagStorage = slot === 'a' ? TAG_ADDRESS_STORAGE : `${TAG_ADDRESS_STORAGE}-${slot}`;
+    this.state = { ...this.state, slot, tagLinked: Boolean(localStorage.getItem(this.#tagStorage)) };
+  }
+
+  get slot() { return this.#slot; }
+  get bluetoothDevice() { return this.#device ?? null; }
 
   onState(listener) {
     this.#listeners.add(listener);
@@ -133,7 +152,7 @@ export class ReonClient {
   #log(direction, name, value) {
     document.dispatchEvent(
       new CustomEvent("reon-log", {
-        detail: { direction, name, hex: value ? toHex(value) : "" },
+        detail: { slot: this.#slot, direction, name, hex: value ? toHex(value) : "" },
       }),
     );
   }
@@ -175,6 +194,13 @@ export class ReonClient {
         filters: [{ namePrefix: "RNP-" }],
         optionalServices: [SERVICE.control, SERVICE.deviceInfo],
       }), 'selecting', 'requestDevice');
+      if (this.#isTaken?.(selected)) {
+        // Never touch the GATT connection: it belongs to the other controller.
+        selected.removeEventListener?.("gattserverdisconnected", this.#onDisconnect);
+        if (this.#device === selected) this.#device = undefined;
+        selected = undefined;
+        throw new DOMException('Device already connected in another slot', 'DuplicateDeviceError');
+      }
       this.#device = selected;
       clearTimeout(timeout);
       timeout = setTimeout(() => controller.abort(new DOMException('GATT initialization timed out', 'TimeoutError')), 20000);
@@ -367,7 +393,7 @@ export class ReonClient {
         false,
       );
       if (!written) return;
-      localStorage.setItem(TAG_ADDRESS_STORAGE, tag.address);
+      localStorage.setItem(this.#tagStorage, tag.address);
       this.#update({ tagLinked: true });
     } catch (error) {
       this.#update({
@@ -389,7 +415,7 @@ export class ReonClient {
       false,
     );
     if (!written) return;
-    localStorage.removeItem(TAG_ADDRESS_STORAGE);
+    localStorage.removeItem(this.#tagStorage);
     this.#update({ tag: null, tagLinked: false });
   }
 
