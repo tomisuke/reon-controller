@@ -1,3 +1,5 @@
+import {STALE_MS,validDistanceRatio} from './distance-core.js';
+
 // Calibrated mapping: the score measured with 2 people 80cm apart drives warm 2, 160cm drives cool 3.
 // Between the two recorded points the signed level (warm +, cool -) changes linearly and is rounded to the
 // nearest hardware level; outside the range the endpoint output is kept. Scores are converted to the raw
@@ -22,22 +24,31 @@ export function calibratedOutput(ratio,c,capabilities={coolLevels:5,warmLevels:4
   const kind=n>0?'warm':'cool',limit=Math.max(1,Math.floor(capabilities?.[kind+'Levels']??5));
   return {kind,level:Math.min(Math.abs(n),limit)};
 }
-// One calibration sample: a fresh, non-held frame with exactly 2 people below the score ceiling.
+export function freshDistanceReading(reading,now=Date.now()){
+  const age=now-Date.parse(reading?.timestamp);
+  return reading?.fresh===true&&Number.isFinite(age)&&age>=-1000&&age<=STALE_MS;
+}
 export function calibrationSample(reading,now=Date.now()){
-  if(!reading?.fresh||reading.holding||reading.personCount!==2||!Number.isFinite(reading.score)||reading.score>=100)return null;
-  const age=now-Date.parse(reading.timestamp);
-  if(!Number.isFinite(age)||age< -1000||age>5000)return null;
-  const ratio=scoreToRatio(reading.score,reading.fullScale??1);
+  if(!freshDistanceReading(reading,now)||reading.holding)return null;
+  if(reading.targetState)return reading.targetState==='locked'&&validDistanceRatio(reading.distanceRatio)?reading.distanceRatio:null;
+  if(reading.personCount!==2)return null;
+  const ratio=scoreToRatio(reading.score,reading.fullScale);
   return Number.isFinite(ratio)?ratio:null;
 }
 export function median(values){const s=[...values].sort((a,b)=>a-b),m=s.length>>1;return s.length%2?s[m]:(s[m-1]+s[m])/2;}
 export function distanceSample(reading,receivedAt,now=Date.now()){
-  if(!reading?.fresh||!Number.isFinite(reading.score)||reading.score<0||reading.score>100)return null;
-  const age=now-Date.parse(reading.timestamp);
-  if(!Number.isFinite(age)||age< -1000||age>5000)return null;
+  if(!freshDistanceReading(reading,now)||!Number.isFinite(reading.score)||reading.score<0||reading.score>100)return null;
   if(reading.holding){
     if(!Number.isFinite(reading.holdRemainingMs)||reading.holdRemainingMs<=0||reading.holdRemainingMs>3000)return null;
     if(now-receivedAt>=reading.holdRemainingMs)return 100;
   }
   return reading.score;
+}
+
+export function distanceRatioSample(reading,receivedAt,now=Date.now()){
+  const score=distanceSample(reading,receivedAt,now);
+  if(score===null)return null;
+  if(!reading.targetState)return scoreToRatio(score,reading.fullScale);
+  if(reading.targetState!=='locked'||(reading.holding&&now-receivedAt>=reading.holdRemainingMs))return null;
+  return validDistanceRatio(reading.distanceRatio)?reading.distanceRatio:null;
 }

@@ -35,6 +35,19 @@ describe('controller integration',()=>{
  test('a contradictory recording clears the other point and disarms the link',async()=>{await click('connect');await calibrate();await distance(20);await change('distance-auto',true);await distance(70);await click('distance-calib-near');for(let i=0;i<3;i++){await distance(70);await advance(1000)}expect($('distance-calib-state').textContent).toBe('160cmが未記録');expect($('distance-calib-message').textContent).toContain('160cmの記録を消去');expect($('distance-auto').checked).toBe(false);expect($('output-status').textContent).toBe('停止')});
  test('calibration reset stops and disarms distance control',async()=>{await click('connect');await calibrate();await distance(20);await change('distance-auto',true);await click('distance-calib-reset');expect($('distance-auto').checked).toBe(false);expect($('output-status').textContent).toBe('停止');expect(JSON.parse(localStorage.getItem('reon-distance-calibration-v1')).near).toBe(null);expect($('distance-estimate').textContent).toBe('未キャリブレーション')});
  test('fresh zero or one person counts as beyond 160cm and holding keeps previous output',async()=>{await click('connect');await calibrate();await distance(20);await change('distance-auto',true);await distance(20,{personCount:1,holding:true,holdRemainingMs:1000});expect($('output-status').textContent).toBe('温熱 2');await advance(1000);expect($('output-status').textContent).toBe('冷却 3');await distance(100,{personCount:0});expect($('distance-auto').checked).toBe(true);expect($('distance-estimate').textContent).toContain('2人未満')});
+ test('locked pair loss stops and disarms REON while bystanders remain visible',async()=>{
+   await click('connect');await calibrate();
+   const locked={targetState:'locked',personCount:3,distanceRatio:.2};
+   await distance(100,locked);await change('distance-auto',true);
+   expect($('output-status').textContent).toBe('温熱 2');
+   await distance(100,{...locked,holding:true,holdRemainingMs:1000});
+   expect($('output-status').textContent).toBe('温熱 2');
+   await advance(1000);
+   expect($('output-status').textContent).toBe('停止');
+   expect($('distance-auto').checked).toBe(false);
+   await distance(20,locked);
+   expect($('output-status').textContent).toBe('停止');
+ });
  test('identical distance output does not resend BLE commands',async()=>{await click('connect');await calibrate();await distance(20);await change('distance-auto',true);const count=hardware.writes.length;for(let i=0;i<10;i++)await distance(14+i);await advance(1000);expect(hardware.writes.length).toBe(count)});
  test('distance update expiry stops, disarms and needs explicit restart',async()=>{await click('connect');await calibrate();await distance(20);await change('distance-auto',true);await advance(5001);expect($('distance-auto').checked).toBe(false);expect($('output-status').textContent).toBe('停止');const count=hardware.writes.length;await distance(100);expect(hardware.writes.length).toBe(count)});
  test('measurement OFF or error stops distance-driven operation immediately',async()=>{await click('connect');await calibrate();await distance(100);await change('distance-auto',true);await distance(100,{fresh:false,status:'stopped'});expect($('distance-auto').checked).toBe(false);expect($('output-status').textContent).toBe('停止')});
