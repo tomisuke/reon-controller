@@ -1,5 +1,26 @@
-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>技術選定と仕様 · DISTANCE</title><link rel="stylesheet" href="distance.css"><style>article{max-width:900px;margin:40px auto;padding:0 24px 60px;font-family:'Noto Sans JP',sans-serif;font-size:14px;line-height:2}h1{font-size:32px}h2{font-size:20px;margin-top:36px}h3{font-size:16px;margin-top:28px}pre{background:#e8eee7;padding:18px;overflow:auto;border-radius:10px}li{margin:12px 0}code{overflow-wrap:anywhere}</style></head><body><article><a href="./#distance-section">← 距離計測に戻る</a><h1>技術選定と仕様</h1><p>映像は端末内で解析し、REON Controllerに0〜100の相対距離スコアを渡します。映像・スコアともに外部のサーバーへは送信しません。</p><h2>スコアの定義</h2><pre>score = min(100, 中心間距離 ÷ 最大距離 × 100)</pre><p>検出枠の中心間のピクセル距離を使用。初期値では映像の対角線を最大距離とし、撮影範囲に合わせて対角線の5〜100%に設定できます。過去最大値で自動補正せず、同じ位置関係は同じスコアになります。中央寄りで大きく映り続ける2人を自動でロックします。手動で人物枠を2つ指定することもできます。対象を見失うと標準1秒（0.5〜3秒に変更可能）保持し、期限後は停止します。</p><p>実距離（m）ではありません。単眼の2D映像なので遠近・角度・遮蔽の影響を受けます。実距離には別途カメラ校正・床面補正や深度センサーが必要です。</p><h2>すべての選定理由</h2><div id="choices"></div><h2>Controllerとの連携</h2><p>Controllerの「人物間の距離」をONにすると、その画面内で解析します。OFFでカメラ・解析を停止し100へ戻します。「プレビューを拡大」「全画面」で同じ映像を大きく表示できます。検出途切れ補正のON/OFFと保持時間も設定できます。同じブラウザ・同じオリジンの別画面も端末内で参照可能です（localStorage / BroadcastChannel）。別端末へスコアを送る共有APIは、GitHub Pagesへの移行（静的配信）に伴い廃止しました。</p><h3>REON連動とキャリブレーション</h3><p>2人の体の中心間を80cm・160cmにしてそれぞれ記録すると、80cmで温熱2、112cm前後で停止、160cmで冷却3になり、間は段階値を線形補間して最も近い段階に丸めます。範囲外は端の出力を維持します。記録値は「中心間距離÷映像の対角線」の比で端末内に保存します。</p><pre>import {localDistance} from './distance-client.js';
-const local = localDistance();
-window.addEventListener('reon-distance', ({detail}) =&gt; {
-  console.log(detail.score);
-});</pre><p>Controller参照中は window.reonDistance にも最新値が入ります。</p><h2>運用上の条件</h2><p>解析中は画面を開いておき、計測画面は1つずつ使用してください。画面の非表示・一時停止・動画終了・切断・解析失敗では停止し100に戻します。バックグラウンド常駐は行いません。実カメラ、REON実機、現場の検出精度は未検証です。冷却・温熱への割り当てはControllerの「REON連動」で明示的にONにしたときだけ行います。</p><p>公式資料: <a href="https://github.com/tensorflow/tfjs-models/blob/master/coco-ssd/README.md">COCO-SSD</a> / <a href="https://www.tensorflow.org/js">TensorFlow.js</a> / <a href="https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia">getUserMedia</a></p></article><script type="module">const choices=[['ブラウザ内推論','映像アップロード、GPUサーバー運用、通信の往復を省きます。初回のモデル取得には通信が必要で、ページを閉じた後の無人解析には対応しません。'],['TensorFlow.js 4.22.0','JavaScriptの映像要素を扱え、既存Web UIに統合しやすいため採用。WebGLを優先し、初期化できなければCPUへ切り替えます。WebGPU必須にはせず、CPUでは速度が下がります。'],['COCO-SSD 2.2.3 / lite_mobilenet_v2','personクラスの学習済みモデルから検出枠を取得でき、学習・変換なしで使えるためです。軽量モデルを選んで端末負荷を抑えます。YOLO系のモデル変換・配布条件の追加判断や、MediaPipe Poseの不要な骨格推定を避けられます。小さい人物・重なり・特殊な視点の精度は保証できません。最大30枠、信頼度の初期値は55%です。'],['HTML / CSS / ES Modules','既存REONと同じ構成を維持。今回の画面には追加UIフレームワークが不要で、ランタイム依存を増やさず拡張できます。'],['getUserMedia / Video / Canvas','ブラウザ標準APIでカメラ入力・動画ファイル再生・枠描画ができるため。音声を取得しません。HTTPSとカメラ許可が必要で、動画コーデック対応はブラウザに依存します。'],['中心間の2D距離と固定スケール','式を説明・再現でき、単眼画像から誤ってメートル値を推定しないため。検出枠の端の間隔は重なると広い範囲が0になるため中心を選択。履歴最大値による自動正規化で値が変わる問題を避けます。検出枠の動き・大きさ・重なりで2人を追跡し、対応が曖昧なときは一時的に計測を保留します。'],['localStorage / BroadcastChannel','同じブラウザ・同じオリジンなら、サーバーなしでスコアを参照できるため。計測画面は1つずつ使用してください。'],['最大5fpsの解析','位置変化への応答と端末負荷のバランスを取る初期設定です。推論を重複実行しません。速度は端末性能に依存します。'],['GitHub Pagesによる静的配信','HTML・CSS・JavaScriptだけで動くため、サーバー実行環境が不要です。HTTPSで配信でき、Web BluetoothとカメラAPIの要件を満たします。GitHub Actionsでテストに通った版だけを公開します。'],['5秒の鮮度期限とタイムアウト','古い近距離スコアを使い続けないため。停止・通信やストレージ障害では100に倒します。'],['固定バージョンのCDN / 表示用Webフォント','MLライブラリを配信物に大きく含めずに済み、バージョン固定で意図しない更新を避けます。CDNとモデル配布元に依存し、配信停止や初回オフラインでは利用できません。Webフォントが取得できない場合はOSのフォントに戻ります。']];const root=document.getElementById('choices');for(const[title,body]of choices){const h=document.createElement('h3'),p=document.createElement('p');h.textContent=title;p.textContent=body;root.append(h,p);}</script></body></html>
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>人物間の距離の仕組み · REON Controller</title>
+<link rel="stylesheet" href="distance.css">
+<style>article{max-width:860px;margin:40px auto;padding:0 24px 60px;font:14px/1.8 system-ui,sans-serif}code{overflow-wrap:anywhere}h2{margin-top:2rem}</style>
+</head>
+<body>
+<article>
+<a href="./#distance-section">← 距離計測に戻る</a>
+<h1>人物間の距離の仕組み</h1>
+<h2>身体間隔スコア</h2>
+<p>COCO-SSDで人物を検出し、選んだ2人を個別に切り出して、MediaPipe Pose Landmarker Liteが見えている肩・胴体・手足などを推定します。対象の2人の身体の輪郭を近似し、最も近い部分の間隔を0〜100のスコアで表示します。初期設定では映像の対角線が100に相当します。</p>
+<p>中央寄りで大きく映る2人を自動で選ぶか、人物枠をタップして対象を指定できます。遮蔽や画面外のため測れないときは、直前の値を標準1秒だけ保持します。カメラの遠近や撮影角度はスコアに影響します。</p>
+<h2>床面距離</h2>
+<p>カメラを固定し、床に置いた長方形の実際の幅と奥行き、映像上の四隅を入力すると、2人の足元どうしの床面距離をcmで推定できます。2人の両足を校正範囲内に収めてください。カメラ位置や画角を変えた場合は四隅を指定し直します。</p>
+<h2>REON連動</h2>
+<p>身体の最も近い部分どうしの間隔を80cmと160cmにして、それぞれを記録します。80cmで温熱2、112cm前後で停止、160cmで冷却3になり、間は線形に補間して段階に丸めます。以前の中心間距離を使った記録がある場合も再校正してください。床面距離は画面に表示されます。</p>
+<h2>映像と測定値</h2>
+<p>映像の解析はブラウザ内で行います。初回のモデル取得にはインターネット接続が必要です。同じブラウザ・オリジンでは、<code>distance-client.js</code> の <code>localDistance()</code> から最新のスコアや床面距離を参照できます。</p>
+<p><a href="https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker/web_js">MediaPipe Pose Landmarkerの資料</a></p>
+</article>
+</body>
+</html>

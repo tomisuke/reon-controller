@@ -9,6 +9,7 @@ function show(reading){
     reading.holding?'検出途切れを補正中 · 直前の値を保持':
     reading.targetState==='selecting'?'計測対象の2人を選択中':
     reading.targetState==='lost'?'対象を見失いました · 計測不能':
+    reading.status==='geometry_unavailable'?'重なり・画面外のため身体間隔を計測できません':
     reading.targetState==='locked'?'計測中 · 選択した2人':
     reading.personCount<2?'2人未満のため100':'計測中 · 最も近い2人';
   window.reonDistance=reading;window.dispatchEvent(new CustomEvent('reon-distance',{detail:reading}));

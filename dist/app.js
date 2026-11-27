@@ -16,7 +16,7 @@ const storage={get(key,fallback){try{return JSON.parse(localStorage.getItem(key)
 let motionConfig=storage.get('reon-motion-config',DEFAULT_MOTION_CONFIG);try{validateMotionConfig(motionConfig)}catch{motionConfig={...DEFAULT_MOTION_CONFIG}}
 let motionAuto=false,motionEpoch=0,motionReading=null,m5State=m5.state,motionDemoTimer=null;
 let distanceAuto=false,distanceEpoch=0,distanceReading=null,distanceReceivedAt=0,distanceDirty=false,distanceSending=false;
-const CALIBRATION_KEY='reon-distance-calibration-v1',emptyCalibration=()=>({near:null,far:null,nearAt:null,farAt:null});
+const CALIBRATION_KEY='reon-distance-calibration-v2',emptyCalibration=()=>({near:null,far:null,nearAt:null,farAt:null});
 let distanceCalibration=(()=>{const c=storage.get(CALIBRATION_KEY,null),point=v=>Number.isFinite(v)&&v>=0&&v<=1?v:null;return c?{near:point(c.near),far:point(c.far),nearAt:c.nearAt??null,farAt:c.farAt??null}:emptyCalibration()})(),calibrating=null;
 let rules=storage.get('reon-glass-rules',DEFAULT_RULES);try{validateRules(rules)}catch{rules=structuredClone(DEFAULT_RULES)}
 let demo=false,kind='cool',level=3,sensorAuto=false,source='tag',reading=null,pending=false;
@@ -49,7 +49,7 @@ document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if
 function renderSlot(slot){
   const s=slot.state,id=base=>idOf(base,slot),simulated=demo&&slot.id==='a',connected=simulated||s.connected;
   $(id('connect-label')).textContent=s.connecting?'キャンセル':simulated?'実機を接続':s.connected?'接続を解除':'デバイスを接続';
-  $(id('connection-state')).textContent=simulated?'デモモード':s.connecting?'接続中':s.connected?'接続済み':'未接続';
+  $(id('connection-state')).textContent=simulated?'デモモード':s.reconnecting?'再接続中':s.connecting?'接続中':s.connected?'接続済み':'未接続';
   $(id('connection-dot')).className='dot'+(connected?' connected':s.connecting?' pending':'');
   $(id('device-model')).textContent=simulated?'シミュレーション':s.device&&s.connected?`${s.device.model} · FW ${s.device.firmware}`:'';
   const mode=simulated?demoSlot.state.mode:s.mode;
@@ -68,15 +68,15 @@ function render(){
   const connected=ready(),c=caps(),targets=targetSlots(),running=isRunning(targets);
   document.body.classList.toggle('warm',kind==='warm');
   for(const slot of slots)renderSlot(slot);
-  const busy=slots.some(s=>s.state.connecting);
-  $('demo').disabled=busy;
+  const busy=slots.some(s=>s.state.connecting&&!s.state.reconnecting);
+  $('demo').disabled=slots.some(s=>s.state.connecting);
   // Connection progress/errors: the unit being connected, otherwise the latest failure.
   const focus=slots.find(s=>s.state.connecting)??slots.find(s=>s.state.error&&!s.state.connected)??slots.find(s=>s.state.error);
   const fs=focus?.state;
   $('connection-feedback').hidden=demo||!focus;
   $('connection-spinner').hidden=!fs?.connecting;
   $('connection-feedback').classList.toggle('connection-failed',!!fs?.error);
-  $('connection-message').textContent=!focus?'':(slotPrefix(focus)+(fs.connecting?({selecting:'ブラウザのデバイス選択待ち',connecting:'本体に接続中…',authenticating:'本体の認証中…',reading:'本体の情報を読み取り中…'}[fs.connectionStage]??'接続中…'):fs.error??''));
+  $('connection-message').textContent=!focus?'':(slotPrefix(focus)+(fs.connecting?({selecting:'ブラウザのデバイス選択待ち',connecting:'本体に接続中…',authenticating:'本体の認証中…',reading:'本体の情報を読み取り中…',retrying:'Bluetooth接続を再試行します…'}[fs.connectionStage]??'接続中…'):fs.error??''));
   $('demo-label').hidden=!demo;$('demo').textContent=demo?'デモを終了':'デモを試す';
   const anyRunning=isRunning(connectedSlots());
   $('run-status').classList.toggle('running',anyRunning);$('run-status').replaceChildren(Object.assign(document.createElement('span'),{className:'dot'}),document.createTextNode(anyRunning?'運転中':'停止中'));
@@ -149,7 +149,8 @@ async function stop(reason='運転停止',list=connectedSlots(),{keepAutomation=
   const results=await send(list,()=>STOP,()=>reason);return results.every(r=>r.result===true);
 }
 async function connect(slot,start=false){
-  if(slot.state.connecting)return false;
+  if(slot.state.reconnecting)slot.client.cancelConnection();
+  else if(slot.state.connecting)return false;
   const requested={kind,level};
   if(demo)endDemo();
   await slot.client.connect();if(!slot.state.connected)return false;if(start){kind=requested.kind;level=Math.min(requested.level,maxLevel());await applyManual(true);}return true;
@@ -166,7 +167,7 @@ document.querySelectorAll('[data-copy-diagnostics]').forEach(button=>button.oncl
 $('copy-url').onclick=async()=>{try{await navigator.clipboard.writeText($('app-url').value);toast('URLをコピーしました。Chrome / Edgeなどの対応ブラウザで開いてください。')}catch{$('app-url').focus();$('app-url').select();toast('URLを選択しました。コピーして対応ブラウザで開いてください。')}};
 $('power').onclick=async()=>{if(pending)return;const targets=targetSlots();if(isRunning(targets))return stop('運転停止',targets);if(!targets.length)return connect(slotToConnect(),true);pending=true;render();try{await applyManual(true)}finally{pending=false;render()}};
 async function chooseOutput(outputKind,outputLevel){
-  if(slots.some(s=>s.state.connecting)||pending)return;
+  if(slots.some(s=>s.state.connecting&&!s.state.reconnecting)||pending)return;
   disableMotion();disableDistance();sensorAuto=false;kind=outputKind;level=Math.max(1,Math.min(maxLevel(),outputLevel));render();
   if(targetSlots().length)await applyManual(true);else await connect(slotToConnect(),true);
 }
@@ -283,7 +284,7 @@ function disableMotion(){motionAuto=false;motionEpoch++;if($('motion-auto'))$('m
 function renderMotion(){
   const fresh=motionFresh(),sample=fresh?motionReading:null;
   $('m5-connect-label').textContent=m5State.connecting?'キャンセル':m5State.connected?'接続を解除':'接続';
-  $('m5-status').textContent=demo?'デモセンサー':m5State.connecting?'M5StickS3を選択・接続中…':m5State.connected?(fresh?'加速度を受信中':'加速度の更新待ち'):'未接続';
+  $('m5-status').textContent=demo?'デモセンサー':m5State.reconnecting?'M5StickS3に再接続中…':m5State.retryPending?'M5StickS3への接続を再試行します…':m5State.connecting?'M5StickS3を選択・接続中…':m5State.connected?(fresh?'加速度を受信中':'加速度の更新待ち'):'未接続';
   $('m5-dot').className='dot'+(m5State.connecting?' pending':fresh?' live':'');
   $('motion-mode-label').textContent=motionAuto?'加速度に連動中':'連動オフ';
   $('motion-auto').checked=motionAuto;$('motion-auto').disabled=m5State.connecting;
@@ -324,12 +325,18 @@ for(const slot of slots)slot.client.onState(s=>{
   if(s.tag&&s.tag!==lastTag&&source==='tag'&&s.connected){lastTag=s.tag;acceptReading({temperature:s.tag.temperature,humidity:s.tag.humidity,time:Date.now()});}
   if(previous.connected&&!s.connected){
     slot.distanceApplied=null;
+    slot.excluded=true;
     const remaining=linkedSlots();
     // A remaining unit keeps following the automation; with none left, every automation is cancelled.
     if(automationActive()&&remaining.length){const names=remaining.map(r=>r.label).join('・');log(`本体${slot.label}の接続が切れました。本体${names}で連動を継続します`);toast(`本体${slot.label}の接続が切れました。本体${names}で連動を継続します`);}
     else{disableDistance();disableMotion();sensorAuto=false;log(prefix+'Bluetooth接続が切れました');toast(prefix+'Bluetooth接続が切れました');}
   }
-  if(!previous.connected&&s.connected){slot.excluded=false;slot.distanceApplied=null;log(prefix+'Bluetooth接続完了');if(distanceAuto){distanceDirty=true;void pumpDistance();}}
+  if(!previous.connected&&s.connected){
+    slot.excluded=s.recovered&&automationActive();slot.distanceApplied=null;
+    log(prefix+(s.recovered?'Bluetooth再接続完了':'Bluetooth接続完了'));
+    if(s.recovered)toast(prefix+'Bluetoothに再接続しました。運転や連動の再開は手動で行ってください。');
+    if(distanceAuto&&!slot.excluded){distanceDirty=true;void pumpDistance();}
+  }
   if(s.lastStop&&s.lastStop!==previous.lastStop&&s.lastStop.source==='device_report'){
     // Never restart a unit that stopped by itself; the other unit may keep following the distance.
     if(distanceAuto){slot.excluded=true;slot.distanceApplied=null;if(!linkedSlots().length)disableDistance();}
@@ -340,7 +347,7 @@ for(const slot of slots)slot.client.onState(s=>{
 });
 setInterval(()=>{if(reading&&Date.now()-reading.time>30000&&sensorAuto){stop('センサー更新が30秒途絶えたため停止');toast('センサー更新が途絶えたため停止しました')}renderSensor()},1000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){if(reading&&Date.now()-reading.time>30000&&sensorAuto)stop('センサー値の期限切れで停止');if(motionAuto&&!motionFresh())stop('加速度の期限切れで停止')}});
-window.addEventListener('pagehide',()=>{disableDistance();disableMotion();stopPolling();m5.disconnect();for(const slot of slots)if(slot.state.connected)slot.client.disconnect()});
+window.addEventListener('pagehide',()=>{disableDistance();disableMotion();stopPolling();m5.disconnect();for(const slot of slots)slot.client.disconnect()});
 const browserProblem=bluetoothProblem();$('browser-notice').hidden=!browserProblem;if(browserProblem)$('browser-notice').textContent=browserProblem;
 render();
 

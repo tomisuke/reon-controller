@@ -73,6 +73,15 @@ describe('two REON units',()=>{
   expect(modes(b).at(-1)).toEqual([1,3]);expect(a.writes.length).toBe(countA);expect($('output-status').textContent).toBe('冷却 3');
   b.device.gatt.disconnect();await settle();expect($('distance-auto').checked).toBe(false);
  });
+ test('automatic recovery refreshes the link without rejoining active temperature output',async()=>{
+  await connectBoth();await calibrate();await distance(20);await change('distance-auto',true);
+  const before=modes(a).length;
+  a.device.gatt.disconnect();await settle();
+  await advance(350);expect($('connection-state').textContent).toBe('接続済み');
+  expect($('distance-auto').checked).toBe(true);
+  await distance(60);
+  expect(modes(a)).toHaveLength(before);expect(modes(b).at(-1)).toEqual([1,3]);
+ });
  test('a unit connected during the link joins it',async()=>{
   await click('connect');await calibrate();await distance(20);await change('distance-auto',true);
   picks=[b.device];await click('connect-b');await advance(300);

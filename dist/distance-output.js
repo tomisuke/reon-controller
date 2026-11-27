@@ -3,7 +3,7 @@ import {STALE_MS,validDistanceRatio} from './distance-core.js';
 // Calibrated mapping: the score measured with 2 people 80cm apart drives warm 2, 160cm drives cool 3.
 // Between the two recorded points the signed level (warm +, cool -) changes linearly and is rounded to the
 // nearest hardware level; outside the range the endpoint output is kept. Scores are converted to the raw
-// center distance / video diagonal ratio so that changing the "100 distance" setting keeps the calibration.
+// measured gap / video diagonal ratio so that changing the "100 distance" setting keeps the calibration.
 export const CALIBRATION={near:{cm:80,kind:'warm',level:2},far:{cm:160,kind:'cool',level:3},windowMs:3000,minSamples:2,minGap:.02};
 const signedLevel=p=>p.kind==='warm'?p.level:-p.level;
 export function scoreToRatio(score,fullScale=1){

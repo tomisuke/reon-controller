@@ -8,6 +8,7 @@ export function bluetoothProblem(scope=globalThis) {
 
 export function connectionError(error,stage='selecting',operation='') {
   if(error.name==='AbortError')return null;
+  if(error.name==='ChooserBusyError')return '先に開いたBluetooth選択画面を閉じてから、もう一度接続してください。';
   if(error.name==='DuplicateDeviceError')return 'この本体はもう一方の枠で接続中です。別の本体を選択してください。';
   if(error.name==='NotFoundError')return stage==='selecting'?'デバイスが選択されませんでした。本体ボタンを約2秒押して青いランプを点滅させ、もう一度選択してください。':'本体に必要なBluetoothサービスまたは項目が見つかりません。モデルとファームウェアの互換性を確認してください。';
   if(error.name==='SecurityError'||error.name==='NotAllowedError')return 'Bluetoothの利用が許可されていません。URLをChrome / Edgeで直接開き、ブラウザとOSのBluetooth権限を確認してください。';
