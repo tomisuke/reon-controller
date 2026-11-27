@@ -35,7 +35,7 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
     const image=new Image();image.src='/qa-fixture.jpg';await image.decode();
     const canvas=document.createElement('canvas');canvas.width=image.width;canvas.height=image.height;const ctx=canvas.getContext('2d');window.qaBlank=false;
     ctx.drawImage(image,0,0);const stream=canvas.captureStream(10);window.qaCanvas=canvas;window.qaStream=stream;
-    const timer=setInterval(()=>{if(window.qaBlank){ctx.fillStyle='black';ctx.fillRect(0,0,canvas.width,canvas.height);}else ctx.drawImage(image,0,0);},100);stream.getTracks().forEach(track=>track.addEventListener('ended',()=>clearInterval(timer)));
+    const timer=setInterval(()=>{if(!stream.active){clearInterval(timer);return;}if(window.qaBlank){ctx.fillStyle='black';ctx.fillRect(0,0,canvas.width,canvas.height);}else ctx.drawImage(image,0,0);},100);
     return stream;
    };
   });
@@ -52,12 +52,15 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
   assert.ok(measured.score>=0&&measured.score<100);assert.equal(measured.metric,'selected_body_gap_2d');console.log('Real MediaPipe inference:',JSON.stringify(measured));
   await page.screenshot({path:path.join(output,'distance-detection.png'),fullPage:true});
   // Record the real fixture stream, then exercise the actual video-file input path.
-  const recording=await page.evaluate(async()=>{const recorder=new MediaRecorder(window.qaStream,{mimeType:'video/webm'}),chunks=[];recorder.ondataavailable=e=>chunks.push(e.data);const done=new Promise(resolve=>recorder.onstop=async()=>resolve([...new Uint8Array(await new Blob(chunks).arrayBuffer())]));recorder.start();await new Promise(r=>setTimeout(r,4000));recorder.stop();return done;});
+  const recording=await page.evaluate(async()=>{const recorder=new MediaRecorder(window.qaStream,{mimeType:'video/webm'}),chunks=[];recorder.ondataavailable=e=>chunks.push(e.data);const done=new Promise(resolve=>recorder.onstop=async()=>resolve([...new Uint8Array(await new Blob(chunks).arrayBuffer())]));recorder.start();await new Promise(r=>setTimeout(r,10000));recorder.stop();return done;});
   const videoPath=path.join(output,'people.webm');fs.writeFileSync(videoPath,Buffer.from(recording));
   await page.click('#stop');assert.equal(await page.textContent('#reon-distance-value'),'100');
+  // Give a software-rendered Chromium enough time to process three frames before the clip ends.
+  await page.locator('#video').evaluate(v=>v.defaultPlaybackRate=0.5);
   await page.setInputFiles('#file',videoPath);await page.waitForFunction(()=>window.reonDistance?.status==='tracking',{},{timeout:30000});
   await page.locator('#video').evaluate(v=>v.pause());await page.waitForFunction(()=>window.reonDistance?.score===100);
   await page.locator('#video').evaluate(v=>v.play());await page.waitForFunction(()=>window.reonDistance?.status==='tracking');
+  await page.locator('#video').evaluate(v=>{v.defaultPlaybackRate=1;v.playbackRate=2;});
   await page.waitForFunction(()=>document.getElementById('video').ended&&window.reonDistance?.score===100,{},{timeout:15000});
   await page.click('#stop');
   await page.click('#camera');
