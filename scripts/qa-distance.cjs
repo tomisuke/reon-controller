@@ -2,10 +2,33 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 (async()=>{
  const output=process.env.QA_DIR||path.resolve('.sites-runtime/qa');fs.mkdirSync(output,{recursive:true});
- const fixtureResponse=await fetch('https://raw.githubusercontent.com/ultralytics/assets/main/im/bus.jpg');if(!fixtureResponse.ok)throw Error('Fixture fetch failed');const fixture=Buffer.from(await fixtureResponse.arrayBuffer());
- const browser=await chromium.launch({channel:process.env.QA_CHANNEL??'chrome',headless:true,args:['--enable-webgl','--use-angle=swiftshader','--enable-unsafe-swiftshader']});
+ const fixture=process.env.QA_FIXTURE
+  ?fs.readFileSync(process.env.QA_FIXTURE)
+  :await fetch('https://raw.githubusercontent.com/ultralytics/assets/main/im/bus.jpg').then(async response=>{
+   if(!response.ok)throw Error('Fixture fetch failed');return Buffer.from(await response.arrayBuffer());
+  });
+ const browser=await chromium.launch({...(process.env.QA_CHROMIUM?{executablePath:process.env.QA_CHROMIUM}:{channel:process.env.QA_CHANNEL??'chrome'}),headless:true,args:['--enable-webgl','--use-angle=swiftshader','--enable-unsafe-swiftshader']});
  try{
   const context=await browser.newContext({viewport:{width:1440,height:1100},reducedMotion:'reduce'});
+  const headers={'access-control-allow-origin':'*'};
+  if(process.env.QA_POSE_MODEL)await context.route('**/pose_landmarker_lite.task',route=>route.fulfill({path:process.env.QA_POSE_MODEL,headers}));
+  if(process.env.QA_COCO_DIR){
+   await context.route('https://storage.googleapis.com/tfjs-models/savedmodel/ssdlite_mobilenet_v2/**',route=>{
+    const asset=path.basename(new URL(route.request().url()).pathname);
+    return route.fulfill({path:path.join(process.env.QA_COCO_DIR,asset),headers});
+   });
+   for(const [url,file] of [
+    ['https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js','@tensorflow/tfjs/dist/tf.min.js'],
+    ['https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js','@tensorflow-models/coco-ssd/dist/coco-ssd.min.js'],
+   ]){
+    await context.route(url,route=>route.fulfill({path:require.resolve(file),headers,contentType:'text/javascript'}));
+   }
+  }
+  if(process.env.QA_VISION_DIR)await context.route('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/**',route=>{
+   const asset=new URL(route.request().url()).pathname.split('0.10.21/')[1];
+   return route.fulfill({path:path.join(process.env.QA_VISION_DIR,asset),headers,
+    contentType:asset.endsWith('.wasm')?'application/wasm':'text/javascript'});
+  });
   await context.route('**/qa-fixture.jpg',route=>route.fulfill({contentType:'image/jpeg',body:fixture}));
   await context.addInitScript(()=>{
    navigator.mediaDevices.getUserMedia=async()=>{
@@ -25,8 +48,8 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
   await page.setViewportSize({width:1440,height:1100});
   await page.check('#distance-enabled');
   await page.waitForFunction(()=>window.reonDistance?.status==='tracking',{},{timeout:90000});
-  const measured=await page.evaluate(()=>({score:window.reonDistance.score,people:window.reonDistance.personCount,backend:tf.getBackend()}));
-  assert.ok(measured.score>=0&&measured.score<100);console.log('Real COCO-SSD inference:',JSON.stringify(measured));
+  const measured=await page.evaluate(()=>({score:window.reonDistance.score,people:window.reonDistance.personCount,metric:window.reonDistance.metric}));
+  assert.ok(measured.score>=0&&measured.score<100);assert.equal(measured.metric,'selected_body_gap_2d');console.log('Real MediaPipe inference:',JSON.stringify(measured));
   await page.screenshot({path:path.join(output,'distance-detection.png'),fullPage:true});
   // Record the real fixture stream, then exercise the actual video-file input path.
   const recording=await page.evaluate(async()=>{const recorder=new MediaRecorder(window.qaStream,{mimeType:'video/webm'}),chunks=[];recorder.ondataavailable=e=>chunks.push(e.data);const done=new Promise(resolve=>recorder.onstop=async()=>resolve([...new Uint8Array(await new Blob(chunks).arrayBuffer())]));recorder.start();await new Promise(r=>setTimeout(r,4000));recorder.stop();return done;});

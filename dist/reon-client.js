@@ -17,6 +17,8 @@ import {
 import { bluetoothProblem, connectionError } from './bluetooth-environment.js';
 import { readable, writable, optionalUnsupported, characteristicProperties, writeCharacteristic } from './gatt.js';
 
+import {RETRY_DELAYS, bluetoothDelay, bluetoothStep, bluetoothTimeout, chooseBluetoothDevice, selectBluetoothDevice, transientBluetoothError} from './bluetooth-retry.js';
+
 const OWNER_KEY_STORAGE = "reon-owner-key";
 const TAG_ADDRESS_STORAGE = "reon-tag-address";
 
@@ -83,8 +85,10 @@ export class ReonClient {
   #listeners = new Set();
   #writeQueue = Promise.resolve();
   #generation = 0;
-  #connectionAttempt = 0;
   #connectionAbort = null;
+  #handshakeAbort = null;
+  #linkAbort = null;
+  #notifications = [];
   #pollTimer = null;
   #refreshing = false;
   #unreadable = new Set();
@@ -92,21 +96,51 @@ export class ReonClient {
   #lastModeCommand = null;
   #canRead(name) { return readable(this.#characteristics[name]) && !this.#unreadable.has(name); }
   #stopPolling() { if (this.#pollTimer !== null) window.clearInterval(this.#pollTimer); this.#pollTimer = null; }
-  #onDisconnect = (event) => {
-    if (event?.target && event.target !== this.#device) return;
+  #clearLink() {
     this.#stopPolling();
-    this.#connectionAbort?.abort(new DOMException('Connection lost', 'NetworkError'));
+    this.#linkAbort?.abort();
+    this.#linkAbort = null;
     this.#generation++;
+    this.#writeQueue = Promise.resolve();
+    this.#refreshing = false;
     this.#manualControlReady = false;
     this.#lastModeCommand = null;
+    for (const [characteristic, listener] of this.#notifications) {
+      characteristic.removeEventListener?.('characteristicvaluechanged',listener);
+    }
+    this.#notifications = [];
     this.#characteristics = {};
-    this.#update({ connected: false, connecting: false, mode: null, tag: null });
+    this.#unreadable.clear();
+  }
+
+  #dropLink(device) {
+    device?.removeEventListener('gattserverdisconnected',this.#onDisconnect);
+    if (device && !this.#isTaken?.(device)) device.gatt.disconnect();
+    this.#clearLink();
+  }
+
+  #recover() {
+    if (!this.state.connected) return;
+    this.#dropLink(this.#device);
+    this.#update({connected:false, mode:null, tag:null});
+    void this.connect({automatic:true});
+  }
+
+  #onDisconnect = event => {
+    if (event.target !== this.#device || event.target.gatt.connected) return;
+    if (this.#handshakeAbort) {
+      this.#handshakeAbort.abort(new DOMException('Connection lost','NetworkError'));
+      return;
+    }
+    this.#recover();
   };
 
   state = {
     connected: false,
     connecting: false,
     connectionStage: 'idle',
+    reconnecting: false,
+    recovered: false,
     device: null,
     capabilities: null,
     mode: null,
@@ -157,162 +191,181 @@ export class ReonClient {
     );
   }
 
-  async connect() {
-    if (this.state.connecting || this.state.connected) return;
+  async connect({automatic=false}={}) {
+    if (this.#connectionAbort || this.state.connected || (automatic && !this.#device)) return;
     const problem = bluetoothProblem();
-    if (problem) { this.#update({ error: problem, connecting: false, connectionStage: 'idle' }); return; }
-    const attempt = ++this.#connectionAttempt;
+    if (problem) { this.#update({error:problem}); return; }
     const controller = new AbortController();
+    const {signal} = controller;
     this.#connectionAbort = controller;
-    let selected, stage = this.#device ? 'connecting' : 'selecting', operationName = 'requestDevice';
-    const properties = {}, info = {}, warnings = [], polling = new Set(), subscribedNames = new Set();
-    this.#unreadable.clear();
-    this.#manualControlReady = false;
-    this.#lastModeCommand = null;
-    let timeout = setTimeout(() => controller.abort(new DOMException('Device chooser timed out', 'TimeoutError')), 45000);
-    const step = (operation, nextStage = stage, label = nextStage, discard) => {
-      stage = nextStage;
-      operationName = label;
-      if (controller.signal.aborted || attempt !== this.#connectionAttempt) return Promise.reject(controller.signal.reason ?? new DOMException('Cancelled', 'AbortError'));
-      this.#update({ connectionStage: stage });
-      return new Promise((resolve, reject) => {
-        const abort = () => reject(controller.signal.reason);
-        controller.signal.addEventListener('abort', abort, { once: true });
-        // Invoke synchronously: requestDevice must keep the click's user activation.
-        try {
-          Promise.resolve(operation()).then(value => {
-            controller.signal.removeEventListener('abort', abort);
-            if (controller.signal.aborted || attempt !== this.#connectionAttempt) { discard?.(value); reject(controller.signal.reason ?? new DOMException('Cancelled', 'AbortError')); }
-            else resolve(value);
-          }, error => { controller.signal.removeEventListener('abort', abort); reject(error); });
-        } catch (error) { controller.signal.removeEventListener('abort', abort); reject(error); }
-      });
-    };
-    this.#update({ connecting: true, connectionStage: stage, error: null, connectionDetail: null, connectionWarnings: [], manualControl:null, lastStop:null });
+    let selected = this.#device;
+    let stage = selected ? 'connecting' : 'selecting', operation = 'requestDevice';
+    let diagnostics = {}, attempts = 0;
+    this.#update({connecting:true, reconnecting:automatic, recovered:false, connectionStage:stage,
+      error:null, connectionWarnings:[], manualControl:null, lastStop:null, mode:null,
+      tag:null, battery:null, temperature:null, autoStart:null, quickLaunch:null});
     try {
-      selected = this.#device ?? await step(() => navigator.bluetooth.requestDevice({
-        filters: [{ namePrefix: "RNP-" }],
-        optionalServices: [SERVICE.control, SERVICE.deviceInfo],
-      }), 'selecting', 'requestDevice');
+      selected ??= await selectBluetoothDevice({
+        filters: [{namePrefix:'RNP-'}],
+        optionalServices: [SERVICE.control,SERVICE.deviceInfo],
+      },signal);
       if (this.#isTaken?.(selected)) {
-        // Never touch the GATT connection: it belongs to the other controller.
-        selected.removeEventListener?.("gattserverdisconnected", this.#onDisconnect);
         if (this.#device === selected) this.#device = undefined;
-        selected = undefined;
-        throw new DOMException('Device already connected in another slot', 'DuplicateDeviceError');
+        throw new DOMException('Device already connected in another slot','DuplicateDeviceError');
       }
       this.#device = selected;
-      clearTimeout(timeout);
-      timeout = setTimeout(() => controller.abort(new DOMException('GATT initialization timed out', 'TimeoutError')), 20000);
-      this.#device.removeEventListener("gattserverdisconnected", this.#onDisconnect);
-      this.#device.addEventListener("gattserverdisconnected", this.#onDisconnect);
-
-      const server = await step(() => selected.gatt.connect(), 'connecting', 'GATT.connect', late => { if (attempt === this.#connectionAttempt || this.#device !== selected) late.disconnect(); });
-      const control = await step(() => server.getPrimaryService(SERVICE.control), 'connecting', 'control.getPrimaryService');
-      const owner = await step(() => control.getCharacteristic(CHARACTERISTIC.owner), 'authenticating', 'owner.getCharacteristic');
-      properties.owner = characteristicProperties(owner);
-      const ownerFrame = Uint8Array.of(1, ...ownerKey());
-      this.#log("write", "owner", ownerFrame);
-      await step(() => writeCharacteristic(owner, ownerFrame), 'authenticating', 'owner.write');
-
-      try {
-        const infoService = await step(() => server.getPrimaryService(SERVICE.deviceInfo), 'reading', 'deviceInfo.getPrimaryService');
-        for (const name of ['model', 'firmware']) {
-          try {
-            const characteristic = await step(() => infoService.getCharacteristic(DEVICE_INFO[name]), 'reading', `${name}.getCharacteristic`);
-            properties[name] = characteristicProperties(characteristic);
-            if (!readable(characteristic)) throw new DOMException('Characteristic is not readable', 'NotSupportedError');
-            const value = await step(() => characteristic.readValue(), 'reading', `${name}.read`);
-            info[name] = new TextDecoder().decode(value).replaceAll('\0', '');
-          } catch (error) { if (!optionalUnsupported(error)) throw error; warnings.push(`${name}: ${error.name}`); }
+      const delays = automatic ? RETRY_DELAYS : [0,...RETRY_DELAYS];
+      for (const delay of delays) {
+        if (delay) {
+          this.#update({connectionStage:'retrying'});
+          await bluetoothDelay(delay,signal);
         }
-      } catch (error) { if (!optionalUnsupported(error)) throw error; warnings.push(`deviceInfo: ${error.name}`); }
-      const deviceInfo = { name: selected.name, model: info.model??selected.name, firmware: info.firmware??'—' };
-      const capability = await step(() => control.getCharacteristic(CHARACTERISTIC.capability), 'reading', 'capability.getCharacteristic');
-      properties.capability = characteristicProperties(capability);
-      const capabilityValue = await step(() => capability.readValue(), 'reading', 'capability.read');
-      const capabilities = parseCapabilities(capabilityValue);
-
-      const characteristicNames = ["mode", "battery", "temperature"];
-      characteristicNames.push("authentication");
-      if (capabilities.autoStart) {
-        characteristicNames.push("autoStart");
-      }
-      if (capabilities.quickLaunch) {
-        characteristicNames.push("quickLaunch");
-      }
-      for (const name of characteristicNames) {
+        attempts++;
+        const handshake = new AbortController();
+        this.#handshakeAbort = handshake;
+        const timeout = bluetoothTimeout(AbortSignal.any([signal,handshake.signal]),20000);
+        const deadline = timeout.signal;
+        diagnostics = {properties:{}, info:{}, warnings:[], polling:new Set()};
+        const step = (run, nextStage, label, discard) => {
+          stage = nextStage;
+          operation = label;
+          if (this.state.connectionStage !== stage) this.#update({connectionStage:stage});
+          return bluetoothStep(run,deadline,discard);
+        };
         try {
-          const characteristic = await step(() => control.getCharacteristic(CHARACTERISTIC[name]), 'reading', `${name}.getCharacteristic`);
-          properties[name] = characteristicProperties(characteristic);
-          this.#characteristics[name] = characteristic;
-          if (name === 'mode' && !writable(characteristic)) throw new DOMException('Mode characteristic is not writable', 'NotSupportedError');
-        } catch (error) { if (name === 'mode' || !optionalUnsupported(error)) throw error; warnings.push(`${name}: ${error.name}`); }
+          selected.addEventListener('gattserverdisconnected',this.#onDisconnect);
+          const server = await step(() => selected.gatt.connect(),'connecting','GATT.connect',late => {
+            if ((!this.#connectionAbort || this.#connectionAbort === controller) &&
+                !this.state.connected && !this.#handshakeAbort && !this.#isTaken?.(selected)) late.disconnect();
+          });
+          const {deviceInfo,capabilities,values} = await this.#initializeConnection(selected,server,step,diagnostics);
+          if (deadline.aborted) throw deadline.reason;
+          this.#applyValues(values);
+          if (deadline.aborted) throw deadline.reason;
+          this.#handshakeAbort = null;
+          this.#connectionAbort = null;
+          this.#linkAbort = new AbortController();
+          const {info,properties,polling,warnings} = diagnostics;
+          this.#update({connected:true, connecting:false, reconnecting:false, recovered:automatic,
+            connectionStage:'idle', device:deviceInfo, capabilities, connectionWarnings:warnings,
+            connectionDetail:{device:selected.name, model:info.model??null, firmware:info.firmware??null,
+              properties, polling:[...polling], warnings, attempts, automatic}});
+          if (polling.size && this.state.connected) this.#pollTimer = window.setInterval(() => {
+            if (!this.state.connected || this.#refreshing) return;
+            this.refresh([...polling]).catch(error => { this.#log('error','poll',new TextEncoder().encode(error.message)); });
+          },5000);
+          return;
+        } catch (error) {
+          if (this.#connectionAbort !== controller) return;
+          this.#handshakeAbort = null;
+          this.#dropLink(selected);
+          if (signal.aborted || attempts === delays.length || operation === 'owner.write' || !transientBluetoothError(error)) throw error;
+        } finally { timeout.clear(); }
       }
-      capabilities.autoStart = capabilities.autoStart && writable(this.#characteristics.autoStart);
-      capabilities.quickLaunch = capabilities.quickLaunch && writable(this.#characteristics.quickLaunch);
-      capabilities.tagLink = writable(this.#characteristics.authentication);
-
-      for (const name of ['mode', 'battery', 'temperature'].filter(name=>this.#characteristics[name])) {
-        let subscribed = false;
-        try { subscribed = await step(() => this.#subscribe(name), 'reading', `${name}.startNotifications`); }
-        catch (error) { if (!optionalUnsupported(error)) throw error; warnings.push(`${name}.startNotifications: ${error.name}`); }
-        if (!subscribed && readable(this.#characteristics[name])) polling.add(name);
-        if (subscribed) subscribedNames.add(name);
-        if (name === 'mode' && !subscribed && !readable(this.#characteristics[name])) throw new DOMException('Mode has no supported state read or notification procedure', 'NotSupportedError');
-      }
-      const values = [];
-      for (const name of ['mode', 'battery', 'temperature', 'autoStart', 'quickLaunch'].filter(name => readable(this.#characteristics[name]))) {
-        try { values.push([name, await step(() => this.#read(name), 'reading', `${name}.read`)]); }
-        catch (error) {
-          if (!optionalUnsupported(error) || (name === 'mode' && !subscribedNames.has(name))) throw error;
-          this.#unreadable.add(name); polling.delete(name); warnings.push(`${name}.read: ${error.name}`);
-        }
-      }
-      this.#applyValues(values);
-      this.#update({
-        connected: true,
-        connecting: false,
-        connectionStage: 'idle',
-        device: deviceInfo,
-        capabilities,
-        connectionWarnings: warnings,
-        connectionDetail: { device: selected.name, model: info.model??null, firmware: info.firmware??null, properties, polling: [...polling], warnings },
-      });
-      this.#stopPolling();
-      if (polling.size) this.#pollTimer = window.setInterval(() => {
-        if (!this.state.connected || this.#refreshing) return;
-        this.refresh([...polling]).catch(error => { this.#log('error', 'poll', new TextEncoder().encode(error.message)); });
-      }, 5000);
     } catch (error) {
-      if (attempt !== this.#connectionAttempt) return;
-      selected?.gatt?.disconnect();
+      if (this.#connectionAbort !== controller) return;
       this.#device = undefined;
-      this.#characteristics = {};
-      this.#update({
-        connected: false,
-        connecting: false,
-        connectionStage: 'idle',
-        error: connectionError(error, stage, operationName),
-        connectionDetail: { stage, operation: operationName, error: error.name, message: error.message, device: selected?.name??null, model: info.model??null, firmware: info.firmware??null, properties, warnings },
-      });
-      this.#log("error", error.name, new TextEncoder().encode(error.message));
+      const {info,properties,warnings} = diagnostics;
+      this.#update({connected:false, connecting:false, reconnecting:false, connectionStage:'idle',
+        error:connectionError(error,stage,operation),
+        connectionDetail:{stage, operation, error:error.name, message:error.message, device:selected?.name??null,
+          model:info?.model??null, firmware:info?.firmware??null, properties, warnings, attempts, automatic}});
+      this.#log('error',error.name,new TextEncoder().encode(error.message));
     } finally {
-      clearTimeout(timeout);
-      if (attempt === this.#connectionAttempt) this.#connectionAbort = null;
+      if (this.#connectionAbort === controller) this.#connectionAbort = null;
     }
   }
 
+  async #initializeConnection(selected, server, step, {properties,info,warnings,polling}) {
+    const subscribedNames = new Set();
+    const control = await step(() => server.getPrimaryService(SERVICE.control), 'connecting', 'control.getPrimaryService');
+    const owner = await step(() => control.getCharacteristic(CHARACTERISTIC.owner), 'authenticating', 'owner.getCharacteristic');
+    properties.owner = characteristicProperties(owner);
+    const ownerFrame = Uint8Array.of(1, ...ownerKey());
+    this.#log("write", "owner", ownerFrame);
+    await step(() => writeCharacteristic(owner, ownerFrame), 'authenticating', 'owner.write');
+
+    try {
+      const infoService = await step(() => server.getPrimaryService(SERVICE.deviceInfo), 'reading', 'deviceInfo.getPrimaryService');
+      for (const name of ['model', 'firmware']) {
+        try {
+          const characteristic = await step(() => infoService.getCharacteristic(DEVICE_INFO[name]), 'reading', `${name}.getCharacteristic`);
+          properties[name] = characteristicProperties(characteristic);
+          if (!readable(characteristic)) throw new DOMException('Characteristic is not readable', 'NotSupportedError');
+          const value = await step(() => characteristic.readValue(), 'reading', `${name}.read`);
+          info[name] = new TextDecoder().decode(value).replaceAll('\0', '');
+        } catch (error) { if (!optionalUnsupported(error)) throw error; warnings.push(`${name}: ${error.name}`); }
+      }
+    } catch (error) { if (!optionalUnsupported(error)) throw error; warnings.push(`deviceInfo: ${error.name}`); }
+    const deviceInfo = { name: selected.name, model: info.model??selected.name, firmware: info.firmware??'—' };
+    const capability = await step(() => control.getCharacteristic(CHARACTERISTIC.capability), 'reading', 'capability.getCharacteristic');
+    properties.capability = characteristicProperties(capability);
+    const capabilityValue = await step(() => capability.readValue(), 'reading', 'capability.read');
+    const capabilities = parseCapabilities(capabilityValue);
+
+    const characteristicNames = ["mode", "battery", "temperature"];
+    characteristicNames.push("authentication");
+    if (capabilities.autoStart) {
+      characteristicNames.push("autoStart");
+    }
+    if (capabilities.quickLaunch) {
+      characteristicNames.push("quickLaunch");
+    }
+    for (const name of characteristicNames) {
+      try {
+        const characteristic = await step(() => control.getCharacteristic(CHARACTERISTIC[name]), 'reading', `${name}.getCharacteristic`);
+        properties[name] = characteristicProperties(characteristic);
+        this.#characteristics[name] = characteristic;
+        if (name === 'mode' && !writable(characteristic)) throw new DOMException('Mode characteristic is not writable', 'NotSupportedError');
+      } catch (error) { if (name === 'mode' || !optionalUnsupported(error)) throw error; warnings.push(`${name}: ${error.name}`); }
+    }
+    capabilities.autoStart = capabilities.autoStart && writable(this.#characteristics.autoStart);
+    capabilities.quickLaunch = capabilities.quickLaunch && writable(this.#characteristics.quickLaunch);
+    capabilities.tagLink = writable(this.#characteristics.authentication);
+
+    for (const name of ['mode', 'battery', 'temperature'].filter(name=>this.#characteristics[name])) {
+      let subscribed = false;
+      try { subscribed = await step(() => this.#subscribe(name), 'reading', `${name}.startNotifications`); }
+      catch (error) { if (!optionalUnsupported(error)) throw error; warnings.push(`${name}.startNotifications: ${error.name}`); }
+      if (!subscribed && readable(this.#characteristics[name])) polling.add(name);
+      if (subscribed) subscribedNames.add(name);
+      if (name === 'mode' && !subscribed && !readable(this.#characteristics[name])) throw new DOMException('Mode has no supported state read or notification procedure', 'NotSupportedError');
+    }
+    const values = [];
+    for (const name of ['mode', 'battery', 'temperature', 'autoStart', 'quickLaunch'].filter(name => readable(this.#characteristics[name]))) {
+      try { values.push([name, await step(() => this.#read(name), 'reading', `${name}.read`)]); }
+      catch (error) {
+        if (!optionalUnsupported(error) || (name === 'mode' && !subscribedNames.has(name))) throw error;
+        this.#unreadable.add(name); polling.delete(name); warnings.push(`${name}.read: ${error.name}`);
+      }
+    }
+    return {deviceInfo,capabilities,values};
+  }
+
   cancelConnection() {
-    this.#connectionAbort?.abort(new DOMException('Cancelled', 'AbortError'));
-    this.#update({ connecting: false, connectionStage: 'idle', error: null });
+    if (!this.#connectionAbort) return;
+    this.#connectionAbort.abort();
+    this.#connectionAbort = this.#handshakeAbort = null;
+    this.#dropLink(this.#device);
+    this.#update({connecting:false, reconnecting:false, connectionStage:'idle', error:null});
   }
 
   disconnect() {
-    this.#stopPolling();
-    this.cancelConnection();
-    this.#generation++;
-    this.#device?.gatt?.disconnect();
+    if (this.#connectionAbort) { this.cancelConnection(); return; }
+    if (!this.state.connected) return;
+    this.#dropLink(this.#device);
+    this.#update({connected:false, reconnecting:false, mode:null, tag:null});
+  }
+
+  #linkStep(run, generation) {
+    const signal = this.#linkAbort?.signal;
+    if (generation !== this.#generation || !signal) throw new DOMException('Connection lost','AbortError');
+    const timeout = bluetoothTimeout(signal,8000);
+    return bluetoothStep(run,timeout.signal).catch(error => {
+      if (generation === this.#generation && (error.name === 'TimeoutError' ||
+          (error.name === 'NetworkError' && !this.#device?.gatt.connected))) this.#recover();
+      throw error;
+    }).finally(timeout.clear);
   }
 
   async refresh(requestedNames = [
@@ -330,12 +383,12 @@ export class ReonClient {
       const values = [];
       for (const name of requestedNames.filter(name => this.#canRead(name))) {
         if (generation !== this.#generation) return;
-        values.push([name, await this.#read(name)]);
+        values.push([name, await this.#linkStep(() => this.#read(name),generation)]);
       }
       if (generation === this.#generation) this.#applyValues(values);
     });
     this.#writeQueue = run.catch(()=>{});
-    try { await run; } finally { this.#refreshing = false; }
+    try { await run; } finally { if (generation === this.#generation) this.#refreshing = false; }
   }
 
   writeMode(frame, guard) {
@@ -359,13 +412,13 @@ export class ReonClient {
     }
     // This is the wear-detection setting, not a thermal protection override.
     this.#log('write','autoStart',automationFrame(false));
-    try { await writeCharacteristic(characteristic,automationFrame(false)); }
+    try { await this.#linkStep(() => writeCharacteristic(characteristic,automationFrame(false)),generation); }
     catch (error) { throw fail(error.message); }
     if (generation !== this.#generation) return;
     let verified = false;
     if (this.#canRead('autoStart')) {
       try {
-        const value = await this.#read('autoStart');
+        const value = await this.#linkStep(() => this.#read('autoStart'),generation);
         if (value.byteLength < 1 || parseAutomation(value)) throw fail('無効化後も本体がONを報告しています。');
         verified = true;
       } catch (error) {
@@ -380,13 +433,15 @@ export class ReonClient {
   }
 
   async linkTag() {
+    const generation = this.#generation;
     this.#update({ pairingTag: true, error: null });
     try {
-      const device = await navigator.bluetooth.requestDevice({
+      const device = await chooseBluetoothDevice({
         filters: [{ services: [SERVICE.tag] }],
         optionalManufacturerData: [SONY_COMPANY_ID],
       });
       const tag = await receiveTagAdvertisement(device);
+      if (generation !== this.#generation || !this.state.connected) return;
       const written = await this.#write(
         "authentication",
         tagRegistrationFrame(tag.address),
@@ -444,10 +499,14 @@ export class ReonClient {
     if (!characteristic.properties.notify && !characteristic.properties.indicate) {
       return false;
     }
-    characteristic.addEventListener("characteristicvaluechanged", (event) => {
+    const generation = this.#generation;
+    const listener = event => {
+      if (generation !== this.#generation) return;
       this.#log("notify", name, event.target.value);
       this.#applyValues([[name, event.target.value]]);
-    });
+    };
+    this.#notifications.push([characteristic,listener]);
+    characteristic.addEventListener("characteristicvaluechanged",listener);
     await characteristic.startNotifications();
     return true;
   }
@@ -491,10 +550,11 @@ export class ReonClient {
         if (this.state.error) this.#update({error:null});
         if (requestedMode) this.#lastModeCommand = requestedMode;
         this.#log("write", name, frame);
-        await writeCharacteristic(this.#characteristics[name], frame);
+        await this.#linkStep(() => writeCharacteristic(this.#characteristics[name],frame),generation);
         if (generation !== this.#generation) return false;
         if (readBack && this.#canRead(name)) {
-          this.#applyValues([[name, await this.#read(name)]]);
+          const value = await this.#linkStep(() => this.#read(name),generation);
+          if (generation === this.#generation) this.#applyValues([[name,value]]);
         }
         return true;
       })
